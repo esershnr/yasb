@@ -20,6 +20,8 @@ class NotificationsMenuConfig(CustomBaseModel):
     max_height: int = Field(default=400, ge=100)
     max_notifications: int = Field(default=30, ge=1)
     show_app_icons: bool = True
+    show_images: bool = True
+    image_max_height: int = Field(default=180, ge=40)
     group_by_app: bool = True
     show_dnd_toggle: bool = True
     show_notification_center: bool = True
