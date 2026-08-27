@@ -2,7 +2,7 @@ import asyncio
 import ctypes
 import logging
 from ctypes import POINTER, byref, c_void_p
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import winrt.windows.ui.notifications.management as management
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -14,6 +14,7 @@ from winrt.windows.ui.notifications import (
 )
 
 from core.events.service import EventService
+from core.widgets.services.notifications.toast_images import read_toast_images
 
 _ntdll = ctypes.WinDLL("ntdll")
 
@@ -70,6 +71,11 @@ class NotificationItem:
     title: str
     body: str
     created_at: str  # ISO 8601, consumed by core.utils.time_utils.get_relative_time
+    # Local file paths, resolved by core.widgets.services.notifications.toast_images
+    app_logo: str = ""
+    app_logo_circle: bool = False
+    hero: str = ""
+    inline_images: tuple[str, ...] = ()
 
 
 class WindowsNotificationEventListener(QThread):
@@ -289,7 +295,38 @@ class WindowsNotificationEventListener(QThread):
             logging.error("Error reading notifications: %s", e)
             return []
         # Windows returns the oldest first, but the newest belongs at the top of the menu
-        return [self._to_item(n) for n in reversed(list(notifications))]
+        items = [self._to_item(n) for n in reversed(list(notifications))]
+        return self._with_images(items)
+
+    @staticmethod
+    def _with_images(items: list[NotificationItem]) -> list[NotificationItem]:
+        """Attach the images the toasts carry, which the listener API does not hand out.
+
+        They are only in the payload Windows kept for itself, so the whole batch is looked
+        up in one read instead of once per notification.
+        """
+        try:
+            images = read_toast_images({item.id: item.aumid for item in items})
+        except Exception:
+            logging.exception("Failed to read toast images")
+            return items
+
+        enriched: list[NotificationItem] = []
+        for item in items:
+            found = images.get(item.id)
+            if found is None:
+                enriched.append(item)
+                continue
+            enriched.append(
+                replace(
+                    item,
+                    app_logo=found.app_logo,
+                    app_logo_circle=found.app_logo_circle,
+                    hero=found.hero,
+                    inline_images=found.inline,
+                )
+            )
+        return enriched
 
     @classmethod
     def _to_item(cls, notification: UserNotification) -> NotificationItem:

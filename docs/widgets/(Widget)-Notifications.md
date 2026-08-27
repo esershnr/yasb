@@ -10,7 +10,7 @@ Displays the number of unread Windows notifications in your status bar. Clicking
 | `tooltip`  | boolean  | `true`        | Whether to show the tooltip on hover. |
 | `icons`          | dict    | `{'new': '\udb80\udc9e', 'default': '\udb80\udc9a', 'dnd_on': '\udb80\udc9b', 'dnd_off': '\udb80\udc9a', 'dismiss': '\uf00d'}`               | Icons for different notification states.                                    |
 | `hide_empty`       | boolean  | `false`  | Whether to hide the widget when there are no notifications. |
-| `menu`       | dict  | `{'blur': True, 'round_corners': True, 'round_corners_type': 'normal', 'border_color': 'System', 'alignment': 'right', 'direction': 'down', 'offset_top': 6, 'offset_left': 0, 'width': 380, 'max_height': 400, 'max_notifications': 30, 'show_app_icons': True, 'group_by_app': True, 'show_dnd_toggle': True, 'show_notification_center': True}`  | Menu settings for the notification popup. |
+| `menu`       | dict  | `{'blur': True, 'round_corners': True, 'round_corners_type': 'normal', 'border_color': 'System', 'alignment': 'right', 'direction': 'down', 'offset_top': 6, 'offset_left': 0, 'width': 380, 'max_height': 400, 'max_notifications': 30, 'show_app_icons': True, 'show_images': True, 'image_max_height': 180, 'group_by_app': True, 'show_dnd_toggle': True, 'show_notification_center': True}`  | Menu settings for the notification popup. |
 | `callbacks`       | dict    | `{'on_left': 'toggle_menu', 'on_middle': 'do_nothing', 'on_right': 'do_nothing'}` | Callbacks for mouse events on the notifications widget. |
 
 ## Example Configuration
@@ -32,6 +32,8 @@ Displays the number of unread Windows notifications in your status bar. Clicking
         max_height: 400
         group_by_app: true
         show_app_icons: true
+        show_images: true
+        image_max_height: 180
       callbacks:
         on_left: "toggle_menu"
         on_right: "toggle_notification"
@@ -62,7 +64,9 @@ Displays the number of unread Windows notifications in your status bar. Clicking
   - **width:** The width of the menu in pixels. Notification text is elided to fit.
   - **max_height:** The maximum height of the scrollable notification list in pixels.
   - **max_notifications:** The maximum number of notifications shown in the menu.
-  - **show_app_icons:** Whether to show the icon of the app that sent the notification.
+  - **show_app_icons:** Whether to show the icon of the app that sent the notification, or the app logo the toast supplies in its place.
+  - **show_images:** Whether to show the images a notification carries: the app logo it can put in place of the app icon, the hero image above it and any inline images below the text.
+  - **image_max_height:** The maximum height of a hero or inline image in pixels. Images are scaled to fit the menu width and this height, and are never enlarged.
   - **group_by_app:** Whether to group notifications under a header per app.
   - **show_dnd_toggle:** Whether to show the Do Not Disturb toggle in the menu header. The toggle is hidden automatically if Windows Focus Assist cannot be reached.
   - **show_notification_center:** Whether to show the footer link that opens the Windows Notification Center.
@@ -79,6 +83,9 @@ Displays the number of unread Windows notifications in your status bar. Clicking
 
 > [!IMPORTANT]
 > Reading notifications requires the global **Let apps access my notifications** switch under Settings > Privacy & security > Notifications. Windows does not track this permission per app for apps installed outside the Store, so YASB has no entry of its own there. When the switch is off the menu says so and links to that page, while the count on the bar keeps working.
+
+> [!NOTE]
+> Notification images are read from the toast Windows stored locally, since the notification listener only hands out the text of a notification. Images an app references over `http(s)` are not shown: Windows only downloads those for apps installed from the Store, and YASB does not fetch them itself.
 
 ## Available Callbacks
 
@@ -180,6 +187,16 @@ Displays the number of unread Windows notifications in your status bar. Clicking
 }
 .notification-menu .item .icon {
     margin-right: 10px;
+}
+/* The image a toast can show in place of the app icon */
+.notification-menu .item .icon.app-logo {
+    margin-right: 10px;
+}
+.notification-menu .item .hero {
+    margin-bottom: 8px;
+}
+.notification-menu .item .inline-image {
+    margin-top: 8px;
 }
 .notification-menu .item .title {
     font-size: 13px;

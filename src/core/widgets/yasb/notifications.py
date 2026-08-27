@@ -1,7 +1,7 @@
 import logging
 import re
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 from PIL.ImageQt import ImageQt
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QMouseEvent, QPixmap
@@ -39,6 +39,12 @@ except ImportError:
     logging.warning("Failed to load Windows Notification Event Listener")
 
 APP_ICON_SIZE = 20
+# Room for the margin, border and padding the stylesheet puts around an item, so a full
+# width image does not push the list wider than the menu
+IMAGE_MARGIN = 32
+# Toast images are keyed by a path that changes with every notification, unlike the app
+# icons keyed by AUMID, so this cache needs a lid on it. Large enough to hold a full menu
+IMAGE_CACHE_SIZE = 128
 # Holds the global "Let apps access my notifications" switch
 NOTIFICATION_PRIVACY_URI = "ms-settings:privacy-notifications"
 
@@ -65,6 +71,8 @@ class NotificationsWidget(BaseWidget):
         self._header_label: QLabel | None = None
         self._dnd_button: QLabel | None = None
         self._icon_cache: dict[tuple[str, float], QPixmap | None] = {}
+        # (path, width, height, circle, dpr) -> pixmap
+        self._image_cache: dict[tuple[str, int, int, bool, float], QPixmap | None] = {}
 
         self._init_container()
         self.build_widget_label(self.config.label, self.config.label_alt)
@@ -414,18 +422,30 @@ class NotificationsWidget(BaseWidget):
         container = QFrame(parent)
         container.setProperty("class", " ".join(["item", *position_classes]))
         container.setContentsMargins(0, 0, 0, 0)
-        container_layout = QHBoxLayout(container)
+        container_layout = QVBoxLayout(container)
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(0)
 
+        # The Notification Center draws the hero above everything and the inline images
+        # below the text, with the rest of the toast on a single row in between
+        hero_label = self._build_image_label(notification.hero, "hero")
+        if hero_label is not None:
+            container_layout.addWidget(hero_label)
+
+        row_layout = QHBoxLayout()
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(0)
+        container_layout.addLayout(row_layout)
+
         if self.config.menu.show_app_icons:
-            icon = self._get_app_icon(notification.aumid)
+            icon, from_toast = self._build_item_icon(notification)
             if icon is not None:
                 icon_label = QLabel()
-                icon_label.setProperty("class", "icon")
+                # An app logo override belongs in the app icon's place, the way Windows shows it
+                icon_label.setProperty("class", "icon app-logo" if from_toast else "icon")
                 # No fixed size: it would fight the stylesheet box model and clip the pixmap
                 icon_label.setPixmap(icon)
-                container_layout.addWidget(icon_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+                row_layout.addWidget(icon_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         title_label = ElidedLabel(notification.title or "(no content)")
         title_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -454,14 +474,19 @@ class NotificationsWidget(BaseWidget):
             description_label.setContentsMargins(0, 0, 0, 0)
             text_content_layout.addWidget(description_label)
 
-        container_layout.addWidget(text_content, 1)
+        row_layout.addWidget(text_content, 1)
 
         dismiss_label = QLabel(self.config.icons.dismiss)
         dismiss_label.setProperty("class", "dismiss")
         dismiss_label.setCursor(Qt.CursorShape.PointingHandCursor)
         dismiss_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         dismiss_label.mousePressEvent = self._create_dismiss_event(notification.id)
-        container_layout.addWidget(dismiss_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        row_layout.addWidget(dismiss_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        for path in notification.inline_images:
+            image_label = self._build_image_label(path, "inline-image")
+            if image_label is not None:
+                container_layout.addWidget(image_label)
 
         container.mousePressEvent = self._create_activate_event(notification)
         return container
@@ -503,8 +528,7 @@ class NotificationsWidget(BaseWidget):
     def _get_app_icon(self, aumid: str) -> QPixmap | None:
         if not aumid:
             return None
-        screen = self._menu.screen() if is_valid_qobject(self._menu) else self.screen()
-        dpr = float(screen.devicePixelRatio()) if screen is not None else 1.0
+        dpr = self._device_pixel_ratio()
 
         cache_key = (aumid, dpr)
         if cache_key in self._icon_cache:
@@ -527,3 +551,95 @@ class NotificationsWidget(BaseWidget):
 
         self._icon_cache[cache_key] = pixmap
         return pixmap
+
+    def _device_pixel_ratio(self) -> float:
+        screen = self._menu.screen() if is_valid_qobject(self._menu) else self.screen()
+        return float(screen.devicePixelRatio()) if screen is not None else 1.0
+
+    def _build_item_icon(self, notification: NotificationItem) -> tuple[QPixmap | None, bool]:
+        """Return the icon for a notification, and whether the toast supplied it.
+
+        A toast can override the app icon with one of its own, a contact photo for example.
+        Anything else, including an override that will not load, falls back to the icon of
+        the app that sent it.
+        """
+        if self.config.menu.show_images and notification.app_logo:
+            logo = self._get_app_logo(notification.app_logo, notification.app_logo_circle)
+            if logo is not None:
+                return logo, True
+        return self._get_app_icon(notification.aumid), False
+
+    def _build_image_label(self, path: str, class_name: str) -> QLabel | None:
+        """A full width image row, or None when there is nothing to draw."""
+        if not self.config.menu.show_images or not path:
+            return None
+        pixmap = self._get_notification_image(path)
+        if pixmap is None:
+            return None
+        image_label = QLabel()
+        image_label.setProperty("class", class_name)
+        image_label.setPixmap(pixmap)
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        return image_label
+
+    def _get_app_logo(self, path: str, circle: bool) -> QPixmap | None:
+        """Load the app logo a toast brought with it, cropped square and optionally round."""
+        dpr = self._device_pixel_ratio()
+        size = max(1, int(round(APP_ICON_SIZE * dpr)))
+        cache_key = (path, size, size, circle, dpr)
+        if cache_key in self._image_cache:
+            return self._image_cache[cache_key]
+
+        pixmap = None
+        try:
+            with Image.open(path) as source:
+                # These are photos as often as icons, so they are cropped to fill the square
+                image = ImageOps.fit(source.convert("RGBA"), (size, size), Image.LANCZOS)
+            if circle:
+                round_image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                round_image.paste(image, mask=self._circle_mask(size))
+                image = round_image
+            # Copy to avoid a dangling view into the PIL buffer
+            pixmap = QPixmap.fromImage(ImageQt(image).copy())
+            pixmap.setDevicePixelRatio(dpr)
+        except Exception:
+            logging.debug("Failed to load the app logo of a notification", exc_info=True)
+
+        self._cache_image(cache_key, pixmap)
+        return pixmap
+
+    def _get_notification_image(self, path: str) -> QPixmap | None:
+        """Load a hero or inline image, scaled to fit the menu."""
+        dpr = self._device_pixel_ratio()
+        width = max(1, self.config.menu.width - IMAGE_MARGIN)
+        height = self.config.menu.image_max_height
+        cache_key = (path, width, height, False, dpr)
+        if cache_key in self._image_cache:
+            return self._image_cache[cache_key]
+
+        pixmap = None
+        try:
+            with Image.open(path) as source:
+                image = source.convert("RGBA")
+            # Fits the box without cropping, and leaves an image smaller than it alone
+            image.thumbnail((max(1, int(width * dpr)), max(1, int(height * dpr))), Image.LANCZOS)
+            pixmap = QPixmap.fromImage(ImageQt(image).copy())
+            pixmap.setDevicePixelRatio(dpr)
+        except Exception:
+            logging.debug("Failed to load a notification image", exc_info=True)
+
+        self._cache_image(cache_key, pixmap)
+        return pixmap
+
+    def _cache_image(self, cache_key: tuple[str, int, int, bool, float], pixmap: QPixmap | None):
+        # Dropping the lot is enough: the menu rebuilds from the entries it just filled in
+        if len(self._image_cache) >= IMAGE_CACHE_SIZE:
+            self._image_cache.clear()
+        self._image_cache[cache_key] = pixmap
+
+    @staticmethod
+    def _circle_mask(size: int) -> Image.Image:
+        """A round mask, drawn oversized and scaled back down so the edge is not jagged."""
+        mask = Image.new("L", (size * 4, size * 4), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, size * 4 - 1, size * 4 - 1), fill=255)
+        return mask.resize((size, size), Image.LANCZOS)
