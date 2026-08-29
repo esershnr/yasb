@@ -3,13 +3,16 @@
 The listener hands out only the text elements of a toast, so the images a notification
 carries cannot be reached through it. Windows itself keeps the raw toast XML in a SQLite
 database of its own, and the images it draws are local files referenced from that payload.
-This module reads the payload and turns those references into file paths. It never decodes
-an image: that is the GUI thread's job, the same way app icons are already handled.
+This module reads the payload and turns those references into file paths. A source Windows
+had to fetch over the network is looked up in the record it keeps of its own downloads, so
+nothing here goes to the network either. It never decodes an image: that is the GUI thread's
+job, the same way app icons are already handled.
 """
 
 import logging
 import os
 import sqlite3
+import winreg
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from functools import lru_cache
@@ -27,6 +30,13 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 APPDATA_ROOTS = {"local": "LocalState", "roaming": "RoamingState", "temp": "TempState"}
 # Packaged resources are stored per display scale, so the plain name is often missing
 SCALE_QUALIFIERS = ("", ".scale-200", ".scale-100", ".scale-150", ".scale-400")
+# Windows notes every toast image it downloads here, which is what makes a remote source
+# reachable without asking the network for it a second time
+DOWNLOAD_RECORD = r"Software\Microsoft\Windows\CurrentVersion\PushNotifications\wpnidm"
+DOWNLOAD_URL_PREFIX = "wpnidm:"
+
+# (registry write time, url -> file), rebuilt only once Windows has touched the record
+_downloads: tuple[int, dict[str, str]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,17 +132,14 @@ def _parse_payload(payload: bytes | str, aumid: str) -> ToastImages | None:
 
 
 def _resolve_src(src: str, aumid: str) -> str:
-    """Turn the src of a toast image into a local file path, or an empty string if it has none.
-
-    Remote images are deliberately left alone. Windows only downloads them for packaged
-    senders, and fetching one here would put YASB on the network on behalf of whoever sent
-    the notification, telling them when the menu was opened.
-    """
+    """Turn the src of a toast image into a local file path, or an empty string if it has none."""
     src = src.strip()
     scheme = src.split(":", 1)[0].casefold() if ":" in src else ""
 
-    if not src or scheme in ("http", "https"):
+    if not src:
         return ""
+    if scheme in ("http", "https"):
+        return _resolve_downloaded(src)
     if scheme == "file":
         return _verify(Path(url2pathname(urlparse(src).path)))
     if scheme == "ms-appdata":
@@ -171,6 +178,48 @@ def _resolve_appx(src: str, aumid: str) -> str:
         if verified:
             return verified
     return ""
+
+
+def _resolve_downloaded(url: str) -> str:
+    """Find the copy Windows downloaded for a remote source, without fetching it again.
+
+    Messaging apps send the sender's picture as an https URL, so this is the difference
+    between showing a contact photo and showing the app icon. Windows has already fetched
+    it to draw the toast, and notes where it put it. YASB never asks the network itself:
+    requesting one of these would tell the sender when the menu was opened.
+    """
+    cached = _read_download_record().get(url, "")
+    return _verify(Path(cached)) if cached else ""
+
+
+def _read_download_record() -> dict[str, str]:
+    """The url to file map Windows keeps, re-read only when it has changed."""
+    global _downloads
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, DOWNLOAD_RECORD) as key:
+            entries, _, written = winreg.QueryInfoKey(key)
+            if _downloads is None or _downloads[0] != written:
+                _downloads = (written, _read_download_entries(key, entries))
+    except OSError as e:
+        logging.debug("No record of downloaded toast images: %s", e)
+        return {}
+    return _downloads[1]
+
+
+def _read_download_entries(key, entries: int) -> dict[str, str]:
+    downloads: dict[str, str] = {}
+    for index in range(entries):
+        try:
+            with winreg.OpenKey(key, winreg.EnumKey(key, index)) as entry:
+                url = str(winreg.QueryValueEx(entry, "Url")[0])
+                path = str(winreg.QueryValueEx(entry, "LocalPath")[0])
+        except OSError:
+            # An entry can be dropped while it is being enumerated, the rest are still good
+            continue
+        url = url.removeprefix(DOWNLOAD_URL_PREFIX)
+        if url and path:
+            downloads[url] = path
+    return downloads
 
 
 def _package_family_name(aumid: str) -> str:

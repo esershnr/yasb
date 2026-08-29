@@ -85,7 +85,7 @@ Displays the number of unread Windows notifications in your status bar. Clicking
 > Reading notifications requires the global **Let apps access my notifications** switch under Settings > Privacy & security > Notifications. Windows does not track this permission per app for apps installed outside the Store, so YASB has no entry of its own there. When the switch is off the menu says so and links to that page, while the count on the bar keeps working.
 
 > [!NOTE]
-> Notification images are read from the toast Windows stored locally, since the notification listener only hands out the text of a notification. Images an app references over `http(s)` are not shown: Windows only downloads those for apps installed from the Store, and YASB does not fetch them itself.
+> Notification images are read from the toast Windows stored locally, since the notification listener only hands out the text of a notification. Messaging apps usually send the sender's picture as an `http(s)` address rather than a file; Windows downloads those itself and notes where it put them, and that note is what YASB reads. YASB never requests an image over the network, so a picture Windows did not keep is not shown.
 
 ## Available Callbacks
 
