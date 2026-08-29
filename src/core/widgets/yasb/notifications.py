@@ -38,7 +38,6 @@ except ImportError:
     WindowsNotificationEventListener = None
     logging.warning("Failed to load Windows Notification Event Listener")
 
-APP_ICON_SIZE = 20
 # Room for the margin, border and padding the stylesheet puts around an item, so a full
 # width image does not push the list wider than the menu
 IMAGE_MARGIN = 32
@@ -536,7 +535,7 @@ class NotificationsWidget(BaseWidget):
 
         pixmap = None
         try:
-            size = max(1, int(round(APP_ICON_SIZE * dpr)))
+            size = self._icon_pixels(dpr)
             image = get_icon_for_aumid(aumid, size=size)
             if image is not None:
                 if image.mode != "RGBA":
@@ -551,6 +550,14 @@ class NotificationsWidget(BaseWidget):
 
         self._icon_cache[cache_key] = pixmap
         return pixmap
+
+    def _icon_pixels(self, dpr: float) -> int:
+        """The icon edge in device pixels.
+
+        A stylesheet cannot resize this: Qt draws a label's pixmap at the size it was made
+        at, so the size has to be known before the pixmap is built.
+        """
+        return max(1, int(round(self.config.menu.app_icon_size * dpr)))
 
     def _device_pixel_ratio(self) -> float:
         screen = self._menu.screen() if is_valid_qobject(self._menu) else self.screen()
@@ -585,7 +592,7 @@ class NotificationsWidget(BaseWidget):
     def _get_app_logo(self, path: str, circle: bool) -> QPixmap | None:
         """Load the app logo a toast brought with it, cropped square and optionally round."""
         dpr = self._device_pixel_ratio()
-        size = max(1, int(round(APP_ICON_SIZE * dpr)))
+        size = self._icon_pixels(dpr)
         cache_key = (path, size, size, circle, dpr)
         if cache_key in self._image_cache:
             return self._image_cache[cache_key]
