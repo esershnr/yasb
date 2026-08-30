@@ -66,12 +66,24 @@ class ToastImages:
     inline: tuple[str, ...] = ()  # everything else, in payload order
 
 
-def read_toast_images(senders: dict[int, str]) -> dict[int, ToastImages]:
-    """Return the images of the given notifications, keyed by notification id.
+@dataclass(frozen=True, slots=True)
+class ToastDetails:
+    """What the database holds for one toast on top of the text the listener hands out."""
+
+    images: ToastImages = ToastImages()
+    # How the database spells the sender, and the name Windows shows for it. Only of use
+    # for a toast the listener could not name at all, which it cannot for a sender whose
+    # AUMID is not registered
+    sender: str = ""
+    sender_name: str = ""
+
+
+def read_toast_details(senders: dict[int, str]) -> dict[int, ToastDetails]:
+    """Return what the database holds for the given notifications, keyed by notification id.
 
     `senders` maps a notification id to the AUMID that sent it, which is needed both to
     resolve package relative sources and to confirm the row is the notification we asked
-    for. Notifications without a usable image are left out of the result.
+    for. Notifications the database has nothing to add to are left out of the result.
     """
     # Before anything else, so an emptied Notification Center takes the copies with it
     _prune_kept(senders)
@@ -84,8 +96,8 @@ def read_toast_images(senders: dict[int, str]) -> dict[int, ToastImages]:
         logging.debug("Failed to read the notification database: %s", e)
         return {}
 
-    images: dict[int, ToastImages] = {}
-    for notification_id, payload, primary_id, sender_icon in rows:
+    details: dict[int, ToastDetails] = {}
+    for notification_id, payload, primary_id, sender_icon, sender_name in rows:
         aumid = senders.get(notification_id, "")
         # The id is the only link between the listener and the database, so a row whose
         # sender disagrees is treated as somebody else's notification rather than trusted
@@ -98,9 +110,9 @@ def read_toast_images(senders: dict[int, str]) -> dict[int, ToastImages]:
             # toast has been drawn, while this copy is kept by Windows for as long as the
             # sender is registered. It is what the Notification Center keeps showing
             parsed = replace(parsed, app_logo=_resolve_src(sender_icon, primary_id or aumid))
-        if parsed.app_logo or parsed.hero or parsed.inline:
-            images[notification_id] = parsed
-    return images
+        if parsed.app_logo or parsed.hero or parsed.inline or primary_id:
+            details[notification_id] = ToastDetails(parsed, primary_id, sender_name)
+    return details
 
 
 def _same_sender(aumid: str, primary_id: str) -> bool:
@@ -116,23 +128,32 @@ def _same_sender(aumid: str, primary_id: str) -> bool:
     return bool(family_name) and family_name.casefold() == _package_family_name(primary_id).casefold()
 
 
-def _read_payloads(notification_ids: list[int]) -> list[tuple[int, bytes, str, str]]:
+def _read_payloads(notification_ids: list[int]) -> list[tuple[int, bytes, str, str, str]]:
     """Read the stored payloads in one query, without taking a write lock on the database.
 
-    The icon Windows keeps for the sender comes along with them: a browser registers one per
-    website, and it outlives the picture the toast itself points at.
+    What Windows registered for the sender comes along with them. The icon is one a browser
+    registers per website, and it outlives the picture the toast itself points at; the name
+    is the one the Notification Center heads the group with, which is worth having for a
+    sender the listener will not name.
     """
     placeholders = ",".join("?" * len(notification_ids))
     query = (
-        "SELECT n.Id, n.Payload, h.PrimaryId, a.AssetValue FROM Notification n "
+        "SELECT n.Id, n.Payload, h.PrimaryId, "
+        "MAX(CASE WHEN a.AssetKey = 'IconUri' THEN a.AssetValue END), "
+        "MAX(CASE WHEN a.AssetKey = 'DisplayName' THEN a.AssetValue END) "
+        "FROM Notification n "
         "LEFT JOIN NotificationHandler h ON h.RecordId = n.HandlerId "
-        "LEFT JOIN HandlerAssets a ON a.HandlerId = h.RecordId AND a.AssetKey = 'IconUri' "
-        f"WHERE n.Type = 'toast' AND n.PayloadType = 'Xml' AND n.Id IN ({placeholders})"
+        "LEFT JOIN HandlerAssets a ON a.HandlerId = h.RecordId "
+        f"WHERE n.Type = 'toast' AND n.PayloadType = 'Xml' AND n.Id IN ({placeholders}) "
+        "GROUP BY n.Id"
     )
     uri = f"file:{quote(NOTIFICATION_DATABASE.as_posix())}?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=CONNECT_TIMEOUT)
     try:
-        return [(row[0], row[1], row[2] or "", row[3] or "") for row in connection.execute(query, notification_ids)]
+        return [
+            (row[0], row[1], row[2] or "", row[3] or "", row[4] or "")
+            for row in connection.execute(query, notification_ids)
+        ]
     finally:
         connection.close()
 
