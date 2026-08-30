@@ -14,7 +14,7 @@ import os
 import sqlite3
 import winreg
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
@@ -69,15 +69,20 @@ def read_toast_images(senders: dict[int, str]) -> dict[int, ToastImages]:
         return {}
 
     images: dict[int, ToastImages] = {}
-    for notification_id, payload, primary_id in rows:
+    for notification_id, payload, primary_id, sender_icon in rows:
         aumid = senders.get(notification_id, "")
         # The id is the only link between the listener and the database, so a row whose
         # sender disagrees is treated as somebody else's notification rather than trusted
         if aumid and primary_id and not _same_sender(aumid, primary_id):
             logging.debug("Notification %s is held for %s, not %s", notification_id, primary_id, aumid)
             continue
-        parsed = _parse_payload(payload, aumid)
-        if parsed is not None:
+        parsed = _parse_payload(payload, aumid) or ToastImages()
+        if not parsed.app_logo and sender_icon:
+            # The picture in the payload is written by the sender and often deleted once the
+            # toast has been drawn, while this copy is kept by Windows for as long as the
+            # sender is registered. It is what the Notification Center keeps showing
+            parsed = replace(parsed, app_logo=_resolve_src(sender_icon, primary_id or aumid))
+        if parsed.app_logo or parsed.hero or parsed.inline:
             images[notification_id] = parsed
     return images
 
@@ -95,18 +100,23 @@ def _same_sender(aumid: str, primary_id: str) -> bool:
     return bool(family_name) and family_name.casefold() == _package_family_name(primary_id).casefold()
 
 
-def _read_payloads(notification_ids: list[int]) -> list[tuple[int, bytes, str]]:
-    """Read the stored payloads in one query, without taking a write lock on the database."""
+def _read_payloads(notification_ids: list[int]) -> list[tuple[int, bytes, str, str]]:
+    """Read the stored payloads in one query, without taking a write lock on the database.
+
+    The icon Windows keeps for the sender comes along with them: a browser registers one per
+    website, and it outlives the picture the toast itself points at.
+    """
     placeholders = ",".join("?" * len(notification_ids))
     query = (
-        "SELECT n.Id, n.Payload, h.PrimaryId FROM Notification n "
+        "SELECT n.Id, n.Payload, h.PrimaryId, a.AssetValue FROM Notification n "
         "LEFT JOIN NotificationHandler h ON h.RecordId = n.HandlerId "
+        "LEFT JOIN HandlerAssets a ON a.HandlerId = h.RecordId AND a.AssetKey = 'IconUri' "
         f"WHERE n.Type = 'toast' AND n.PayloadType = 'Xml' AND n.Id IN ({placeholders})"
     )
     uri = f"file:{quote(NOTIFICATION_DATABASE.as_posix())}?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=CONNECT_TIMEOUT)
     try:
-        return [(row[0], row[1], row[2] or "") for row in connection.execute(query, notification_ids)]
+        return [(row[0], row[1], row[2] or "", row[3] or "") for row in connection.execute(query, notification_ids)]
     finally:
         connection.close()
 
