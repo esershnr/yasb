@@ -91,6 +91,8 @@ Displays the number of unread Windows notifications in your status bar. Clicking
 
 > [!NOTE]
 > Notification images are read from the toast Windows stored locally, since the notification listener only hands out the text of a notification. Messaging apps usually send the sender's picture as an `http(s)` address rather than a file; Windows downloads those itself and notes where it put them, and that note is what YASB reads. YASB never requests an image over the network, so a picture Windows did not keep is not shown.
+>
+> The file a notification points at usually belongs to the app that sent it and is deleted as soon as the toast has been drawn, long before the notification leaves the Notification Center. YASB copies each picture to `%LOCALAPPDATA%\YASB\notification_images` the first time it sees it so the menu goes on showing what Windows shows, and deletes a copy once its notification is gone.
 
 ## Available Callbacks
 

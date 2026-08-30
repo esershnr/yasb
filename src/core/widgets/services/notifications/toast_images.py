@@ -7,10 +7,15 @@ This module reads the payload and turns those references into file paths. A sour
 had to fetch over the network is looked up in the record it keeps of its own downloads, so
 nothing here goes to the network either. It never decodes an image: that is the GUI thread's
 job, the same way app icons are already handled.
+
+A picture is copied aside the first time it is seen, because the file the payload points at
+usually does not last as long as the notification does.
 """
 
+import hashlib
 import logging
 import os
+import shutil
 import sqlite3
 import winreg
 import xml.etree.ElementTree as ET
@@ -18,6 +23,8 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
+
+from core.utils.system import app_data_path
 
 _LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", ""))
 NOTIFICATION_DATABASE = _LOCAL_APP_DATA / "Microsoft" / "Windows" / "Notifications" / "wpndatabase.db"
@@ -35,6 +42,11 @@ SCALE_QUALIFIERS = ("", ".scale-200", ".scale-100", ".scale-150", ".scale-400")
 # reachable without asking the network for it a second time
 DOWNLOAD_RECORD = r"Software\Microsoft\Windows\CurrentVersion\PushNotifications\wpnidm"
 DOWNLOAD_URL_PREFIX = "wpnidm:"
+# Where the copies live. A notification outlives the file it was drawn from, so this is
+# what the menu actually reads once the sender has cleaned up after itself
+CACHE_DIRECTORY = "notification_images"
+# Enough of the source to tell two pictures of the same notification apart
+SOURCE_KEY_LENGTH = 12
 
 # (registry write time, url -> file), rebuilt only once Windows has touched the record
 _downloads: tuple[int, dict[str, str]] | None = None
@@ -61,6 +73,8 @@ def read_toast_images(senders: dict[int, str]) -> dict[int, ToastImages]:
     resolve package relative sources and to confirm the row is the notification we asked
     for. Notifications without a usable image are left out of the result.
     """
+    # Before anything else, so an emptied Notification Center takes the copies with it
+    _prune_kept(senders)
     if not senders or not NOTIFICATION_DATABASE.is_file():
         return {}
 
@@ -78,7 +92,7 @@ def read_toast_images(senders: dict[int, str]) -> dict[int, ToastImages]:
         if aumid and primary_id and not _same_sender(aumid, primary_id):
             logging.debug("Notification %s is held for %s, not %s", notification_id, primary_id, aumid)
             continue
-        parsed = _parse_payload(payload, aumid) or ToastImages()
+        parsed = _parse_payload(payload, aumid, notification_id) or ToastImages()
         if not parsed.app_logo and sender_icon:
             # The picture in the payload is written by the sender and often deleted once the
             # toast has been drawn, while this copy is kept by Windows for as long as the
@@ -123,7 +137,7 @@ def _read_payloads(notification_ids: list[int]) -> list[tuple[int, bytes, str, s
         connection.close()
 
 
-def _parse_payload(payload: bytes | str, aumid: str) -> ToastImages | None:
+def _parse_payload(payload: bytes | str, aumid: str, notification_id: int) -> ToastImages | None:
     """Pull the image elements out of a toast payload, keeping the first of each placement."""
     try:
         root = ET.fromstring(payload.decode("utf-8") if isinstance(payload, bytes) else payload)
@@ -137,22 +151,97 @@ def _parse_payload(payload: bytes | str, aumid: str) -> ToastImages | None:
     inline: list[str] = []
 
     for element in root.iter("image"):
-        path = _resolve_src(element.get("src", ""), aumid)
-        if not path:
-            continue
+        src = element.get("src", "")
         placement = (element.get("placement") or "").casefold()
         if placement == "applogooverride":
-            if not app_logo:
-                app_logo = path
-                app_logo_circle = (element.get("hint-crop") or "").casefold() == "circle"
+            if app_logo:
+                continue
+            role = "logo"
         elif placement == "hero":
-            hero = hero or path
+            if hero:
+                continue
+            role = "hero"
+        else:
+            role = f"inline{len(inline)}"
+
+        path = _keep(notification_id, role, src, _resolve_src(src, aumid))
+        if not path:
+            continue
+        if role == "logo":
+            app_logo = path
+            app_logo_circle = (element.get("hint-crop") or "").casefold() == "circle"
+        elif role == "hero":
+            hero = path
         else:
             inline.append(path)
 
     if not (app_logo or hero or inline):
         return None
     return ToastImages(app_logo, app_logo_circle, hero, tuple(inline))
+
+
+def _keep(notification_id: int, role: str, src: str, resolved: str) -> str:
+    """The copy of a toast image kept for as long as the notification is there.
+
+    The file a payload points at belongs to the sender and is normally deleted as soon as
+    the toast has been drawn: a browser writes the picture a website asked for into a
+    temporary file and clears it out within seconds, while the notification itself sits in
+    the Notification Center for as long as nobody dismisses it. Reading the payload again
+    later then finds nothing, and the item silently drops to whatever the fallbacks can
+    offer, which is not the picture Windows goes on showing.
+
+    So the first read takes a copy and every read after it is served from that copy. The
+    copies are named after the notification and the source they were taken from, and the
+    ones whose notification has gone are deleted, which keeps this bounded by what the
+    Notification Center itself holds.
+    """
+    kept = _kept_path(notification_id, role, src, resolved)
+    if kept is None:
+        return resolved
+    if kept.is_file():
+        return str(kept)
+    if not resolved:
+        return ""
+    try:
+        shutil.copyfile(resolved, kept)
+    except OSError as e:
+        logging.debug("Failed to keep a copy of %s: %s", resolved, e)
+        return resolved
+    return str(kept)
+
+
+def _kept_path(notification_id: int, role: str, src: str, resolved: str) -> Path | None:
+    """Where the copy of one image of one notification belongs, or None with nowhere to put it."""
+    if not src:
+        return None
+    try:
+        directory = app_data_path(CACHE_DIRECTORY)
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logging.debug("No place to keep toast images: %s", e)
+        return None
+    # The suffix is only there to keep the folder readable, nothing opens these by name
+    suffix = Path(resolved or src).suffix[:8]
+    source_key = hashlib.sha1(src.encode("utf-8", "replace")).hexdigest()[:SOURCE_KEY_LENGTH]
+    return directory / f"{notification_id}-{role}-{source_key}{suffix}"
+
+
+def _prune_kept(senders: dict[int, str]) -> None:
+    """Drop the copies of notifications that are no longer in the Notification Center."""
+    try:
+        directory = app_data_path(CACHE_DIRECTORY)
+        if not directory.is_dir():
+            return
+        for kept in directory.iterdir():
+            notification_id, _, _ = kept.name.partition("-")
+            if notification_id.isdigit() and int(notification_id) in senders:
+                continue
+            try:
+                kept.unlink()
+            except OSError as e:
+                logging.debug("Failed to drop the kept copy %s: %s", kept.name, e)
+    except OSError as e:
+        logging.debug("Failed to go through the kept toast images: %s", e)
 
 
 def _resolve_src(src: str, aumid: str) -> str:
