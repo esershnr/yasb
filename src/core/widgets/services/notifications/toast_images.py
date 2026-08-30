@@ -25,6 +25,8 @@ NOTIFICATION_DATABASE = _LOCAL_APP_DATA / "Microsoft" / "Windows" / "Notificatio
 CONNECT_TIMEOUT = 0.5
 # Toast images are small by design, anything past this is decoding cost with nothing to show
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+# Smaller than the header of any image format, so the file cannot be one
+MIN_IMAGE_BYTES = 32
 # ms-appdata:///<root>/ names the per package folders that live under LOCALAPPDATA\Packages
 APPDATA_ROOTS = {"local": "LocalState", "roaming": "RoamingState", "temp": "TempState"}
 # Packaged resources are stored per display scale, so the plain name is often missing
@@ -296,8 +298,10 @@ def _verify(path: Path, root: Path | None = None) -> str:
         if root is not None and not resolved.is_relative_to(root.resolve()):
             logging.debug("Toast image escapes its package folder: %s", path)
             return ""
-        # A missing file is the normal case here, senders clean their temporary images up
-        if not resolved.is_file() or resolved.stat().st_size > MAX_IMAGE_BYTES:
+        # A missing file is the normal case here, senders clean their temporary images up,
+        # and one caught mid-cleanup is empty rather than gone. Both count as no image, so
+        # whatever the caller would fall back to is used instead of a failed decode
+        if not resolved.is_file() or not MIN_IMAGE_BYTES <= resolved.stat().st_size <= MAX_IMAGE_BYTES:
             return ""
     except (OSError, ValueError) as e:
         logging.debug("Unusable toast image path: %s", e)
