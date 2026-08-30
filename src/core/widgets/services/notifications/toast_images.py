@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
-from urllib.request import url2pathname
 
 _LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", ""))
 NOTIFICATION_DATABASE = _LOCAL_APP_DATA / "Microsoft" / "Windows" / "Notifications" / "wpndatabase.db"
@@ -74,13 +73,26 @@ def read_toast_images(senders: dict[int, str]) -> dict[int, ToastImages]:
         aumid = senders.get(notification_id, "")
         # The id is the only link between the listener and the database, so a row whose
         # sender disagrees is treated as somebody else's notification rather than trusted
-        if aumid and primary_id and aumid.casefold() != primary_id.casefold():
+        if aumid and primary_id and not _same_sender(aumid, primary_id):
             logging.debug("Notification %s is held for %s, not %s", notification_id, primary_id, aumid)
             continue
         parsed = _parse_payload(payload, aumid)
         if parsed is not None:
             images[notification_id] = parsed
     return images
+
+
+def _same_sender(aumid: str, primary_id: str) -> bool:
+    """Whether a stored row belongs to the sender the listener named.
+
+    The two do not always spell it the same way. A browser files a website's notifications
+    under an identifier of its own for that site, while the listener reports them as coming
+    from the browser, so the names agree only as far as the package they share.
+    """
+    if aumid.casefold() == primary_id.casefold():
+        return True
+    family_name = _package_family_name(aumid)
+    return bool(family_name) and family_name.casefold() == _package_family_name(primary_id).casefold()
 
 
 def _read_payloads(notification_ids: list[int]) -> list[tuple[int, bytes, str]]:
@@ -141,12 +153,30 @@ def _resolve_src(src: str, aumid: str) -> str:
     if scheme in ("http", "https"):
         return _resolve_downloaded(src)
     if scheme == "file":
-        return _verify(Path(url2pathname(urlparse(src).path)))
+        return _verify(_file_url_to_path(src))
     if scheme == "ms-appdata":
         return _resolve_appdata(src, aumid)
     if scheme == "ms-appx":
         return _resolve_appx(src, aumid)
     return _verify(Path(os.path.expandvars(src)))
+
+
+def _file_url_to_path(src: str) -> Path:
+    """Turn a file: url into a path, whichever way the sender happened to write it.
+
+    Senders are not consistent about this. A screenshot tool writes the separators as
+    backslashes and percent encodes them along with the colon after the drive letter, which
+    the standard conversion does not recognise as a drive at all and turns into a path that
+    cannot be opened.
+    """
+    parsed = urlparse(src)
+    path = unquote(parsed.path).replace("\\", "/")
+    if parsed.netloc:
+        return Path(f"//{parsed.netloc}{path}")
+    # A drive letter arrives as /C:/..., which is not a path until the leading slash goes
+    if len(path) > 2 and path[0] == "/" and path[2] == ":":
+        path = path[1:]
+    return Path(path)
 
 
 def _resolve_appdata(src: str, aumid: str) -> str:
