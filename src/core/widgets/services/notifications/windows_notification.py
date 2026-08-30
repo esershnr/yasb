@@ -14,7 +14,7 @@ from winrt.windows.ui.notifications import (
 )
 
 from core.events.service import EventService
-from core.widgets.services.notifications.toast_images import read_toast_images
+from core.widgets.services.notifications.toast_images import read_toast_details
 
 _ntdll = ctypes.WinDLL("ntdll")
 
@@ -296,34 +296,40 @@ class WindowsNotificationEventListener(QThread):
             return []
         # Windows returns the oldest first, but the newest belongs at the top of the menu
         items = [self._to_item(n) for n in reversed(list(notifications))]
-        return self._with_images(items)
+        return self._with_details(items)
 
     @staticmethod
-    def _with_images(items: list[NotificationItem]) -> list[NotificationItem]:
-        """Attach the images the toasts carry, which the listener API does not hand out.
+    def _with_details(items: list[NotificationItem]) -> list[NotificationItem]:
+        """Fill in what the listener API does not hand out but Windows stored anyway.
 
-        They are only in the payload Windows kept for itself, so the whole batch is looked
-        up in one read instead of once per notification.
+        The images a toast carries are only in the payload Windows kept for itself, and so
+        is the sender of a toast whose AUMID is not registered, which is the one case the
+        listener refuses to name. The whole batch is looked up in one read.
         """
         try:
-            images = read_toast_images({item.id: item.aumid for item in items})
+            details = read_toast_details({item.id: item.aumid for item in items})
         except Exception:
-            logging.exception("Failed to read toast images")
+            logging.exception("Failed to read toast details")
             return items
 
         enriched: list[NotificationItem] = []
         for item in items:
-            found = images.get(item.id)
+            found = details.get(item.id)
             if found is None:
                 enriched.append(item)
                 continue
             enriched.append(
                 replace(
                     item,
-                    app_logo=found.app_logo,
-                    app_logo_circle=found.app_logo_circle,
-                    hero=found.hero,
-                    inline_images=found.inline,
+                    # Only ever a fallback. What the listener reports is the sender the
+                    # shell will activate, while this is how the database files it, which
+                    # for a browser is one entry per website and activates nothing
+                    aumid=item.aumid or found.sender,
+                    app_name=item.app_name or found.sender_name,
+                    app_logo=found.images.app_logo,
+                    app_logo_circle=found.images.app_logo_circle,
+                    hero=found.images.hero,
+                    inline_images=found.images.inline,
                 )
             )
         return enriched
