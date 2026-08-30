@@ -3,7 +3,7 @@ import re
 
 from PIL import Image, ImageDraw, ImageOps
 from PIL.ImageQt import ImageQt
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QObject, QRunnable, Qt, QThreadPool, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QMouseEvent, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
@@ -48,6 +48,44 @@ IMAGE_CACHE_SIZE = 128
 NOTIFICATION_PRIVACY_URI = "ms-settings:privacy-notifications"
 
 
+class AppIconSignals(QObject):
+    # aumid, device pixel ratio, PIL image or None
+    loaded = pyqtSignal(str, float, object)
+
+
+class AppIconLoader(QRunnable):
+    """Extracts the icon of one sender away from the GUI thread.
+
+    The shell hands these out over COM and takes between ten and a hundred milliseconds per
+    app, which is long enough to be felt when a menu holding half a dozen senders is opened.
+    Nothing here touches a widget: the finished image is handed back and turned into a
+    pixmap by the thread that owns them.
+    """
+
+    def __init__(self, aumid: str, size: int, dpr: float):
+        super().__init__()
+        self._aumid = aumid
+        self._size = size
+        self._dpr = dpr
+        self.signals = AppIconSignals()
+
+    def run(self):
+        image = None
+        try:
+            image = get_icon_for_aumid(self._aumid, size=self._size)
+            if image is not None:
+                # Squared off here rather than on the GUI thread, which then has nothing
+                # left to do but wrap the pixels
+                if image.mode != "RGBA":
+                    image = image.convert("RGBA")
+                if image.size != (self._size, self._size):
+                    image = image.resize((self._size, self._size), Image.LANCZOS)
+        except Exception:
+            logging.exception("Failed to load app icon for %s", self._aumid)
+            image = None
+        self.signals.loaded.emit(self._aumid, self._dpr, image)
+
+
 class NotificationsWidget(BaseWidget):
     validation_schema = NotificationsConfig
     windows_notification_update_signal = pyqtSignal(int)
@@ -72,6 +110,12 @@ class NotificationsWidget(BaseWidget):
         self._icon_cache: dict[tuple[str, float], QPixmap | None] = {}
         # (path, width, height, circle, dpr) -> pixmap
         self._image_cache: dict[tuple[str, int, int, bool, float], QPixmap | None] = {}
+        self._icon_pending: set[tuple[str, float]] = set()
+        # The icon slots of the menu as it stands, waiting for a loader to fill them in
+        self._icon_labels: dict[tuple[str, float], list[QLabel]] = {}
+        self._placeholders: dict[float, QPixmap] = {}
+        self._icon_pool = QThreadPool()
+        self._icon_pool.setMaxThreadCount(4)
 
         self._init_container()
         self.build_widget_label(self.config.label, self.config.label_alt)
@@ -110,6 +154,8 @@ class NotificationsWidget(BaseWidget):
         self._update_label()
 
     def _on_notifications_changed(self, notifications: list[NotificationItem]):
+        if self.config.menu.show_app_icons:
+            self._warm_app_icons(notifications)
         # Opening the menu draws the list we already hold and asks the listener for a fresh
         # one at the same time. That reply is usually the same list, and rebuilding every
         # item to arrive at the same menu is the one thing that makes opening it feel slow
@@ -326,7 +372,19 @@ class NotificationsWidget(BaseWidget):
 
     def _populate_menu(self):
         """Rebuild the scroll area contents from the cached notification list."""
+        # The list is thrown away and built again from scratch, so none of the intermediate
+        # states are worth painting
+        self._menu.setUpdatesEnabled(False)
+        try:
+            self._rebuild_contents()
+        finally:
+            self._menu.setUpdatesEnabled(True)
+
+    def _rebuild_contents(self):
         notifications = self._notifications[: self.config.menu.max_notifications]
+        # The slots of the menu being replaced go with it, so a loader that finishes late
+        # has nothing left to fill in
+        self._icon_labels.clear()
 
         content = QWidget()
         content.setProperty("class", "contents")
@@ -458,13 +516,8 @@ class NotificationsWidget(BaseWidget):
         container_layout.addLayout(row_layout)
 
         if self.config.menu.show_app_icons:
-            icon, from_toast = self._build_item_icon(notification)
-            if icon is not None:
-                icon_label = QLabel()
-                # An app logo override belongs in the app icon's place, the way Windows shows it
-                icon_label.setProperty("class", "icon app-logo" if from_toast else "icon")
-                # No fixed size: it would fight the stylesheet box model and clip the pixmap
-                icon_label.setPixmap(icon)
+            icon_label = self._build_icon_label(notification)
+            if icon_label is not None:
                 row_layout.addWidget(icon_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         title_label = ElidedLabel(notification.title or "(no content)")
@@ -545,31 +598,101 @@ class NotificationsWidget(BaseWidget):
 
         return mouse_press_event
 
-    def _get_app_icon(self, aumid: str) -> QPixmap | None:
+    def _build_icon_label(self, notification: NotificationItem) -> QLabel | None:
+        """The icon slot of an item, or None when there is no icon to draw in it.
+
+        A toast can override the app icon with one of its own, a contact photo for example,
+        and that one is a local file which is read straight away. Anything else, including
+        an override that will not load, falls back to the icon of the app that sent it.
+        That one has to be extracted and may not be ready yet, so its slot holds the space
+        with a transparent stand-in and the picture drops into it when the loader is done,
+        rather than pushing the text along.
+        """
+        dpr = self._device_pixel_ratio()
+        if self.config.menu.show_images and notification.app_logo:
+            logo = self._get_app_logo(notification.app_logo, notification.app_logo_circle)
+            if logo is not None:
+                # An app logo override belongs in the app icon's place, the way Windows shows it
+                return self._icon_label(logo, "icon app-logo")
+
+        aumid = notification.aumid
         if not aumid:
             return None
-        dpr = self._device_pixel_ratio()
-
         cache_key = (aumid, dpr)
-        if cache_key in self._icon_cache:
-            return self._icon_cache[cache_key]
+        known = cache_key in self._icon_cache
+        pixmap = self._icon_cache.get(cache_key)
+        if known and pixmap is None:
+            return None
 
-        pixmap = None
-        try:
-            size = self._icon_pixels(dpr)
-            image = get_icon_for_aumid(aumid, size=size)
-            if image is not None:
-                if image.mode != "RGBA":
-                    image = image.convert("RGBA")
-                if image.size != (size, size):
-                    image = image.resize((size, size), Image.LANCZOS)
-                # Copy to avoid a dangling view into the PIL buffer
-                pixmap = QPixmap.fromImage(ImageQt(image).copy())
-                pixmap.setDevicePixelRatio(dpr)
-        except Exception:
-            logging.exception("Failed to load app icon for %s", aumid)
+        icon_label = self._icon_label(pixmap if known else self._placeholder_pixmap(dpr), "icon")
+        if not known:
+            self._icon_labels.setdefault(cache_key, []).append(icon_label)
+            self._request_app_icon(aumid, dpr)
+        return icon_label
 
+    @staticmethod
+    def _icon_label(pixmap: QPixmap, class_name: str) -> QLabel:
+        icon_label = QLabel()
+        icon_label.setProperty("class", class_name)
+        # No fixed size: it would fight the stylesheet box model and clip the pixmap
+        icon_label.setPixmap(pixmap)
+        return icon_label
+
+    def _warm_app_icons(self, notifications: list[NotificationItem]):
+        """Start on the icons of senders we have not seen, before anybody opens the menu.
+
+        The list is normally known well before it is looked at, and extracting an icon is
+        slow enough that doing it on the click is what makes opening the menu feel slow.
+        """
+        dpr = self._device_pixel_ratio()
+        for aumid in {notification.aumid for notification in notifications if notification.aumid}:
+            self._request_app_icon(aumid, dpr)
+
+    def _request_app_icon(self, aumid: str, dpr: float):
+        cache_key = (aumid, dpr)
+        if cache_key in self._icon_cache or cache_key in self._icon_pending:
+            return
+        self._icon_pending.add(cache_key)
+        loader = AppIconLoader(aumid, self._icon_pixels(dpr), dpr)
+        loader.signals.loaded.connect(self._on_app_icon_loaded)
+        self._icon_pool.start(loader)
+
+    def _on_app_icon_loaded(self, aumid: str, dpr: float, image: object):
+        cache_key = (aumid, dpr)
+        self._icon_pending.discard(cache_key)
+        pixmap = self._to_pixmap(image, dpr) if image is not None else None
         self._icon_cache[cache_key] = pixmap
+
+        for icon_label in self._icon_labels.pop(cache_key, []):
+            if not is_valid_qobject(icon_label):
+                continue
+            if pixmap is None:
+                # There is nothing to draw for this sender, so the slot goes away and the
+                # item reads the way every later rebuild will draw it, without one
+                icon_label.hide()
+            else:
+                icon_label.setPixmap(pixmap)
+
+    @staticmethod
+    def _to_pixmap(image: Image.Image, dpr: float) -> QPixmap | None:
+        try:
+            # Copy to avoid a dangling view into the PIL buffer
+            pixmap = QPixmap.fromImage(ImageQt(image).copy())
+            pixmap.setDevicePixelRatio(dpr)
+            return pixmap
+        except Exception:
+            logging.exception("Failed to read an app icon")
+            return None
+
+    def _placeholder_pixmap(self, dpr: float) -> QPixmap:
+        """A transparent pixmap the size of an app icon, holding the space until one lands."""
+        pixmap = self._placeholders.get(dpr)
+        if pixmap is None:
+            size = self._icon_pixels(dpr)
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            pixmap.setDevicePixelRatio(dpr)
+            self._placeholders[dpr] = pixmap
         return pixmap
 
     def _icon_pixels(self, dpr: float) -> int:
@@ -583,19 +706,6 @@ class NotificationsWidget(BaseWidget):
     def _device_pixel_ratio(self) -> float:
         screen = self._menu.screen() if is_valid_qobject(self._menu) else self.screen()
         return float(screen.devicePixelRatio()) if screen is not None else 1.0
-
-    def _build_item_icon(self, notification: NotificationItem) -> tuple[QPixmap | None, bool]:
-        """Return the icon for a notification, and whether the toast supplied it.
-
-        A toast can override the app icon with one of its own, a contact photo for example.
-        Anything else, including an override that will not load, falls back to the icon of
-        the app that sent it.
-        """
-        if self.config.menu.show_images and notification.app_logo:
-            logo = self._get_app_logo(notification.app_logo, notification.app_logo_circle)
-            if logo is not None:
-                return logo, True
-        return self._get_app_icon(notification.aumid), False
 
     def _build_image_label(self, path: str, class_name: str) -> QLabel | None:
         """A full width image row, or None when there is nothing to draw."""
