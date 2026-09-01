@@ -85,7 +85,10 @@ class WindowsNotificationEventListener(QThread):
 
     def __init__(self):
         super().__init__()
-        self.total_notifications = 0
+        # What Windows publishes for the shell, kept only for the case where the list
+        # itself cannot be read. It is not the number the menu shows: see _count_on_bar
+        self._wnf_count = 0
+        self._wnf_stamp: int | None = None
         self.event_service = EventService()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._async_stop_event: asyncio.Event | None = None
@@ -220,16 +223,22 @@ class WindowsNotificationEventListener(QThread):
         self._wnf_active = False
         logging.debug("Unsubscribed from WNF notifications")
 
-    def _wnf_toast_callback(self, _state_name, _change_stamp, _type_id, _context, buffer, buffer_size):
-        """Buffer u32 is the count (Win11 total / Win10 unread badge). Skip unchanged values."""
+    def _wnf_toast_callback(self, _state_name, change_stamp, _type_id, _context, buffer, buffer_size):
+        """Windows wrote the toast counter, which is the signal that the list has changed.
+
+        Every write is taken as a reason to read the list again, including one that leaves
+        the number where it was. The number is not to be trusted on its own: it counts what
+        the shell was told rather than what the Action Center holds, and a notification
+        activated from the Notification Center leaves its share of the count behind. So the
+        buffer (u32: Win11 total / Win10 unread badge) is only kept as a last resort, and
+        the change stamp is what tells one write from the next.
+        """
         try:
-            if not buffer or buffer_size < 4:
+            if change_stamp == self._wnf_stamp:
                 return 0
-            wnf_count = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_uint32))[0]
-            if wnf_count == self.total_notifications:
-                return 0
-            self.total_notifications = wnf_count
-            self.event_service.emit_event("WindowsNotificationUpdate", wnf_count)
+            self._wnf_stamp = change_stamp
+            if buffer and buffer_size >= 4:
+                self._wnf_count = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_uint32))[0]
             # This runs on an ntdll thread, so the fetch is queued onto the listener loop
             self._schedule(self._emit_notifications())
         except Exception:
@@ -283,8 +292,21 @@ class WindowsNotificationEventListener(QThread):
         return self._access_allowed
 
     async def _emit_notifications(self):
-        """Read the current toasts and broadcast them to the widgets."""
-        self.event_service.emit_event("WindowsNotificationsChanged", await self._read_notifications())
+        """Read the current toasts and broadcast them, along with the count, to the widgets."""
+        notifications = await self._read_notifications()
+        self.event_service.emit_event("WindowsNotificationsChanged", notifications)
+        self.event_service.emit_event("WindowsNotificationUpdate", self._count_on_bar(notifications))
+
+    def _count_on_bar(self, notifications: list[NotificationItem]) -> int:
+        """How many notifications there are, counted the way the menu counts them.
+
+        The list is the only honest answer: what Windows publishes for the shell drifts
+        away from it, because a notification activated from the Notification Center is
+        taken off the list without being taken off that count. Which leaves the published
+        number good for one thing, namely the case where there is no list to count, when
+        the user has turned notification access off.
+        """
+        return len(notifications) if self._access_allowed else self._wnf_count
 
     async def _read_notifications(self) -> list[NotificationItem]:
         if not self._listener or not self._refresh_access():
@@ -398,8 +420,7 @@ class WindowsNotificationEventListener(QThread):
         The history is cleared per app rather than in one call: ClearNotifications() fails
         with ERROR_NOT_FOUND for apps installed outside the Store. A removal can still fail
         and a new toast can arrive while this runs, so the result is read back instead of
-        assuming the Action Center is empty. The count on the bar is left to the WNF
-        callback, which reports what Windows itself counts.
+        assuming the Action Center is empty, and it is that result the bar is given.
         """
         try:
             notifications = await self._listener.get_notifications_async(NotificationKinds.TOAST)
