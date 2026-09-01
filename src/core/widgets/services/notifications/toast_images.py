@@ -20,11 +20,11 @@ import sqlite3
 import winreg
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 from core.utils.system import app_data_path
+from core.utils.win32.packages import installed_path, package_family_name
 
 _LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", ""))
 NOTIFICATION_DATABASE = _LOCAL_APP_DATA / "Microsoft" / "Windows" / "Notifications" / "wpndatabase.db"
@@ -67,6 +67,15 @@ class ToastImages:
 
 
 @dataclass(frozen=True, slots=True)
+class ToastPayload:
+    """What one stored toast payload says, beyond the text the listener already hands out."""
+
+    images: ToastImages = ToastImages()
+    launch: str = ""  # What the shell hands the sender when the notification is clicked
+    activation_type: str = ""  # How it is handed over: protocol, foreground, background
+
+
+@dataclass(frozen=True, slots=True)
 class ToastDetails:
     """What the database holds for one toast on top of the text the listener hands out."""
 
@@ -77,6 +86,8 @@ class ToastDetails:
     sender: str = ""
     sender_name: str = ""
     sender_icon: str = ""
+    launch: str = ""
+    activation_type: str = ""
 
 
 def read_toast_details(senders: dict[int, str]) -> dict[int, ToastDetails]:
@@ -105,8 +116,9 @@ def read_toast_details(senders: dict[int, str]) -> dict[int, ToastDetails]:
         if aumid and primary_id and not _same_sender(aumid, primary_id):
             logging.debug("Notification %s is held for %s, not %s", notification_id, primary_id, aumid)
             continue
+        parsed = _parse_payload(payload, aumid, notification_id)
         details[notification_id] = ToastDetails(
-            _parse_payload(payload, aumid, notification_id) or ToastImages(),
+            parsed.images,
             primary_id,
             sender_name,
             # The picture in the payload is written by the sender and often deleted once
@@ -114,6 +126,8 @@ def read_toast_details(senders: dict[int, str]) -> dict[int, ToastDetails]:
             # the sender is registered. It is what the Notification Center heads a website
             # with, and what is left once the sender has cleaned up after itself
             _resolve_src(sender_icon, primary_id or aumid) if sender_icon else "",
+            parsed.launch,
+            parsed.activation_type,
         )
     return details
 
@@ -127,8 +141,8 @@ def _same_sender(aumid: str, primary_id: str) -> bool:
     """
     if aumid.casefold() == primary_id.casefold():
         return True
-    family_name = _package_family_name(aumid)
-    return bool(family_name) and family_name.casefold() == _package_family_name(primary_id).casefold()
+    family_name = package_family_name(aumid)
+    return bool(family_name) and family_name.casefold() == package_family_name(primary_id).casefold()
 
 
 def _read_payloads(notification_ids: list[int]) -> list[tuple[int, bytes, str, str, str]]:
@@ -161,13 +175,16 @@ def _read_payloads(notification_ids: list[int]) -> list[tuple[int, bytes, str, s
         connection.close()
 
 
-def _parse_payload(payload: bytes | str, aumid: str, notification_id: int) -> ToastImages | None:
-    """Pull the image elements out of a toast payload, keeping the first of each placement."""
+def _parse_payload(payload: bytes | str, aumid: str, notification_id: int) -> ToastPayload:
+    """Pull the images and the launch string out of a toast payload.
+
+    Only the first image of each placement is kept, which is the one Windows draws.
+    """
     try:
         root = ET.fromstring(payload.decode("utf-8") if isinstance(payload, bytes) else payload)
     except (ET.ParseError, UnicodeDecodeError, TypeError) as e:
         logging.debug("Unreadable toast payload: %s", e)
-        return None
+        return ToastPayload()
 
     app_logo = ""
     app_logo_circle = False
@@ -202,9 +219,11 @@ def _parse_payload(payload: bytes | str, aumid: str, notification_id: int) -> To
         else:
             inline.append(path)
 
-    if not (app_logo or hero or inline):
-        return None
-    return ToastImages(app_logo, app_logo_circle, hero, tuple(inline))
+    return ToastPayload(
+        ToastImages(app_logo, app_logo_circle, hero, tuple(inline)),
+        (root.get("launch") or "").strip(),
+        (root.get("activationType") or "").strip(),
+    )
 
 
 def _keep(notification_id: int, role: str, src: str, resolved: str) -> str:
@@ -309,7 +328,7 @@ def _file_url_to_path(src: str) -> Path:
 
 def _resolve_appdata(src: str, aumid: str) -> str:
     """Resolve ms-appdata:///local/... against the sending package's own data folder."""
-    family_name = _package_family_name(aumid)
+    family_name = package_family_name(aumid)
     if not family_name or not _LOCAL_APP_DATA.name:
         return ""
 
@@ -324,7 +343,7 @@ def _resolve_appdata(src: str, aumid: str) -> str:
 
 def _resolve_appx(src: str, aumid: str) -> str:
     """Resolve ms-appx:///Assets/... against the sending package's install folder."""
-    root = _installed_path(_package_family_name(aumid))
+    root = installed_path(package_family_name(aumid))
     relative = unquote(urlparse(src).path.lstrip("/"))
     if root is None or not relative:
         return ""
@@ -378,29 +397,6 @@ def _read_download_entries(key, entries: int) -> dict[str, str]:
         if url and path:
             downloads[url] = path
     return downloads
-
-
-def _package_family_name(aumid: str) -> str:
-    """The package family name of a packaged sender, which its AUMID is prefixed with."""
-    return aumid.split("!")[0] if "!" in aumid else ""
-
-
-@lru_cache(maxsize=32)
-def _installed_path(family_name: str) -> Path | None:
-    """Where a packaged app is installed, which is what ms-appx: is relative to."""
-    if not family_name:
-        return None
-    try:
-        from winrt.windows.management.deployment import PackageManager
-
-        # The user scoped lookup is the one that works without elevation
-        for package in PackageManager().find_packages_by_user_security_id_package_family_name("", family_name):
-            installed_path = package.installed_path
-            if installed_path:
-                return Path(installed_path)
-    except Exception as e:
-        logging.debug("Failed to locate package %s: %s", family_name, e)
-    return None
 
 
 def _verify(path: Path, root: Path | None = None) -> str:
