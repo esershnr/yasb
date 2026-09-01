@@ -243,9 +243,8 @@ class NotificationsWidget(BaseWidget):
     def _count_text(self) -> str:
         """The count as it goes on the bar, capped when a cap was asked for.
 
-        The number on the bar and the list in the menu come from two different places and
-        stop agreeing once an app has sent more notifications than Windows keeps for it. A
-        cap keeps the bar from advertising a number the menu cannot account for.
+        A cap is a matter of width rather than of truth: the number counts the same
+        notifications the menu lists, so a long one is only ever a long one.
         """
         max_count = self.config.max_count
         if max_count and self._notification_count > max_count:

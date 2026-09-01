@@ -55,7 +55,7 @@ Displays the number of unread Windows notifications in your status bar. Clicking
   - `dnd_on` / `dnd_off`: the Do Not Disturb toggle in the menu header. `dnd_on` is shown while Do Not Disturb is active (a crossed-out bell), `dnd_off` while notifications are allowed.
   - `dismiss`: the button that removes a single notification.
 - **hide_empty:** Whether to hide the widget when there are no notifications.
-- **max_count:** The highest number written on the bar. Above it the count is shown capped, so `max_count: 9` writes `9+` for anything past nine, which keeps a long count from widening the bar and from advertising a number the menu cannot always account for (see the note below). `0`, the default, always shows the real number. The tooltip and the menu header show the real number either way.
+- **max_count:** The highest number written on the bar. Above it the count is shown capped, so `max_count: 9` writes `9+` for anything past nine, which keeps a long count from widening the bar. `0`, the default, always shows the real number. The tooltip and the menu header show the real number either way.
 - **menu:** Menu settings for the notification popup.
   - **blur:** Whether to apply a blur effect to the menu.
   - **round_corners:** Whether the menu should have rounded corners.
@@ -84,7 +84,9 @@ Displays the number of unread Windows notifications in your status bar. Clicking
 > Clicking a notification brings the sending app to the foreground. Only the dismiss button removes it, and removing a notification here also removes it from the Windows Notification Center.
 
 > [!NOTE]
-> `{count}` on the bar and the list in the menu come from two different places, so they do not always agree. The count is the number Windows publishes for the shell, and what it means depends on the version: on Windows 11 it is the number of notifications in the Notification Center, on Windows 10 it is the taskbar badge, which clears as soon as the Notification Center is opened even though the notifications are still there. The count can also sit above the menu because it counts entries the menu is never given: an app that has sent more than twenty notifications keeps one in the Notification Center that the listener does not hand out, and a badge an app has left behind is counted as well.
+> `{count}` on the bar counts the notifications the menu lists, so the two always agree. Windows publishes a count of its own for the shell, but it is not one to write on a bar: a notification activated from the Notification Center is taken out of the list without being taken out of that count, which then stays too high until something else resets it. It is used for one case only, when the permission below has been turned off and there is no list to count.
+>
+> The list itself has one limit of its own: Windows hands out at most twenty notifications per app, so an app that has sent more than that keeps notifications in the Notification Center that neither the menu nor the count can see.
 
 > [!IMPORTANT]
 > Reading notifications requires the global **Let apps access my notifications** switch under Settings > Privacy & security > Notifications. Windows does not track this permission per app for apps installed outside the Store, so YASB has no entry of its own there. When the switch is off the menu says so and links to that page, while the count on the bar keeps working.
