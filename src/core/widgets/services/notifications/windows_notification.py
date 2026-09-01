@@ -76,6 +76,11 @@ class NotificationItem:
     app_logo_circle: bool = False
     hero: str = ""
     inline_images: tuple[str, ...] = ()
+    # How the notification database files the sender, which for a browser is one entry per
+    # website rather than one for the browser: the sender the Notification Center groups
+    # by and heads with a name and an icon of its own
+    sender_id: str = ""
+    sender_icon: str = ""
 
 
 class WindowsNotificationEventListener(QThread):
@@ -325,8 +330,9 @@ class WindowsNotificationEventListener(QThread):
         """Fill in what the listener API does not hand out but Windows stored anyway.
 
         The images a toast carries are only in the payload Windows kept for itself, and so
-        is the sender of a toast whose AUMID is not registered, which is the one case the
-        listener refuses to name. The whole batch is looked up in one read.
+        is the sender, which the listener reports as the app it came through while the
+        database files it the way the Notification Center groups it, one entry per website
+        for a browser. The whole batch is looked up in one read.
         """
         try:
             details = read_toast_details({item.id: item.aumid for item in items})
@@ -347,11 +353,15 @@ class WindowsNotificationEventListener(QThread):
                     # shell will activate, while this is how the database files it, which
                     # for a browser is one entry per website and activates nothing
                     aumid=item.aumid or found.sender,
-                    app_name=item.app_name or found.sender_name,
+                    # The other way round for the name: the database knows the website a
+                    # notification came from, the listener only knows the browser
+                    app_name=found.sender_name or item.app_name,
                     app_logo=found.images.app_logo,
                     app_logo_circle=found.images.app_logo_circle,
                     hero=found.images.hero,
                     inline_images=found.images.inline,
+                    sender_id=found.sender or item.aumid,
+                    sender_icon=found.sender_icon,
                 )
             )
         return enriched
@@ -382,6 +392,8 @@ class WindowsNotificationEventListener(QThread):
             title=texts[0] if texts else "",
             body="\n".join(texts[1:]),
             created_at=created_at,
+            # Replaced by what the database files the sender under, where it has one
+            sender_id=aumid,
         )
 
     @staticmethod

@@ -21,6 +21,7 @@ class NotificationsMenuConfig(CustomBaseModel):
     max_notifications: int = Field(default=30, ge=1)
     show_app_icons: bool = True
     app_icon_size: int = Field(default=36, ge=8, le=64)
+    section_icon_size: int = Field(default=16, ge=8, le=64)
     show_images: bool = True
     image_max_height: int = Field(default=180, ge=40)
     group_by_app: bool = True

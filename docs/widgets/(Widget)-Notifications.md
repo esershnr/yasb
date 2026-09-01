@@ -11,7 +11,7 @@ Displays the number of unread Windows notifications in your status bar. Clicking
 | `icons`          | dict    | `{'new': '\udb80\udc9e', 'default': '\udb80\udc9a', 'dnd_on': '\udb80\udc9b', 'dnd_off': '\udb80\udc9a', 'dismiss': '\uf00d'}`               | Icons for different notification states.                                    |
 | `hide_empty`       | boolean  | `false`  | Whether to hide the widget when there are no notifications. |
 | `max_count`       | integer  | `0`  | The highest number shown on the bar, above which the count is written as `9+`. `0` shows the count as it is. |
-| `menu`       | dict  | `{'blur': True, 'round_corners': True, 'round_corners_type': 'normal', 'border_color': 'System', 'alignment': 'right', 'direction': 'down', 'offset_top': 6, 'offset_left': 0, 'width': 380, 'max_height': 400, 'max_notifications': 30, 'show_app_icons': True, 'app_icon_size': 36, 'show_images': True, 'image_max_height': 180, 'group_by_app': True, 'show_dnd_toggle': True, 'show_notification_center': True}`  | Menu settings for the notification popup. |
+| `menu`       | dict  | `{'blur': True, 'round_corners': True, 'round_corners_type': 'normal', 'border_color': 'System', 'alignment': 'right', 'direction': 'down', 'offset_top': 6, 'offset_left': 0, 'width': 380, 'max_height': 400, 'max_notifications': 30, 'show_app_icons': True, 'app_icon_size': 36, 'section_icon_size': 16, 'show_images': True, 'image_max_height': 180, 'group_by_app': True, 'show_dnd_toggle': True, 'show_notification_center': True}`  | Menu settings for the notification popup. |
 | `callbacks`       | dict    | `{'on_left': 'toggle_menu', 'on_middle': 'do_nothing', 'on_right': 'do_nothing'}` | Callbacks for mouse events on the notifications widget. |
 
 ## Example Configuration
@@ -35,6 +35,7 @@ Displays the number of unread Windows notifications in your status bar. Clicking
         group_by_app: true
         show_app_icons: true
         app_icon_size: 36
+        section_icon_size: 16
         show_images: true
         image_max_height: 180
       callbacks:
@@ -68,11 +69,12 @@ Displays the number of unread Windows notifications in your status bar. Clicking
   - **width:** The width of the menu in pixels. Notification text is elided to fit.
   - **max_height:** The maximum height of the scrollable notification list in pixels.
   - **max_notifications:** The maximum number of notifications shown in the menu.
-  - **show_app_icons:** Whether to show the icon of the app that sent the notification, or the app logo the toast supplies in its place.
+  - **show_app_icons:** Whether to show the icon of the app that sent the notification, or the app logo the toast supplies in its place. It also covers the icon next to a section header, where Windows has one for the sender.
   - **app_icon_size:** The size of that icon in pixels, between 8 and 64. A stylesheet cannot change it: Qt draws the icon at the size it was built at.
+  - **section_icon_size:** The size in pixels of the icon next to a section header, between 8 and 64. Only senders Windows keeps an icon for have one, which in practice means websites; an app is headed by its name alone.
   - **show_images:** Whether to show the images a notification carries: the app logo it can put in place of the app icon, the hero image above it and any inline images below the text.
   - **image_max_height:** The maximum height of a hero or inline image in pixels. Images are scaled to fit the menu width and this height, and are never enlarged.
-  - **group_by_app:** Whether to group notifications under a header per app.
+  - **group_by_app:** Whether to group notifications under a header per sender, the way the Notification Center groups them. A browser is filed one sender per website, so a page's notifications are headed by the page rather than by the browser.
   - **show_dnd_toggle:** Whether to show the Do Not Disturb toggle in the menu header. The toggle is hidden automatically if Windows Focus Assist cannot be reached.
   - **show_notification_center:** Whether to show the footer link that opens the Windows Notification Center.
 - **callbacks:** Callbacks for mouse events on the notifications widget. The following callbacks are available:

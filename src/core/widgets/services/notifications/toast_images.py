@@ -19,7 +19,7 @@ import shutil
 import sqlite3
 import winreg
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
@@ -71,11 +71,12 @@ class ToastDetails:
     """What the database holds for one toast on top of the text the listener hands out."""
 
     images: ToastImages = ToastImages()
-    # How the database spells the sender, and the name Windows shows for it. Only of use
-    # for a toast the listener could not name at all, which it cannot for a sender whose
-    # AUMID is not registered
+    # How the database spells the sender, together with the name and icon Windows heads it
+    # with. A browser files one sender per website, which is the grouping the Notification
+    # Center shows and the only place a site's own name and icon are to be had
     sender: str = ""
     sender_name: str = ""
+    sender_icon: str = ""
 
 
 def read_toast_details(senders: dict[int, str]) -> dict[int, ToastDetails]:
@@ -83,7 +84,7 @@ def read_toast_details(senders: dict[int, str]) -> dict[int, ToastDetails]:
 
     `senders` maps a notification id to the AUMID that sent it, which is needed both to
     resolve package relative sources and to confirm the row is the notification we asked
-    for. Notifications the database has nothing to add to are left out of the result.
+    for. Notifications the database has no row for are left out of the result.
     """
     # Before anything else, so an emptied Notification Center takes the copies with it
     _prune_kept(senders)
@@ -104,14 +105,16 @@ def read_toast_details(senders: dict[int, str]) -> dict[int, ToastDetails]:
         if aumid and primary_id and not _same_sender(aumid, primary_id):
             logging.debug("Notification %s is held for %s, not %s", notification_id, primary_id, aumid)
             continue
-        parsed = _parse_payload(payload, aumid, notification_id) or ToastImages()
-        if not parsed.app_logo and sender_icon:
-            # The picture in the payload is written by the sender and often deleted once the
-            # toast has been drawn, while this copy is kept by Windows for as long as the
-            # sender is registered. It is what the Notification Center keeps showing
-            parsed = replace(parsed, app_logo=_resolve_src(sender_icon, primary_id or aumid))
-        if parsed.app_logo or parsed.hero or parsed.inline or primary_id:
-            details[notification_id] = ToastDetails(parsed, primary_id, sender_name)
+        details[notification_id] = ToastDetails(
+            _parse_payload(payload, aumid, notification_id) or ToastImages(),
+            primary_id,
+            sender_name,
+            # The picture in the payload is written by the sender and often deleted once
+            # the toast has been drawn, while this one is kept by Windows for as long as
+            # the sender is registered. It is what the Notification Center heads a website
+            # with, and what is left once the sender has cleaned up after itself
+            _resolve_src(sender_icon, primary_id or aumid) if sender_icon else "",
+        )
     return details
 
 
@@ -187,6 +190,9 @@ def _parse_payload(payload: bytes | str, aumid: str, notification_id: int) -> To
 
         path = _keep(notification_id, role, src, _resolve_src(src, aumid))
         if not path:
+            # Worth saying out loud: this is a picture Windows goes on showing and the menu
+            # cannot, because the file the sender named was gone before it could be copied
+            logging.debug("Notification %s has no readable %s image at %s", notification_id, role, src)
             continue
         if role == "logo":
             app_logo = path
