@@ -1,10 +1,11 @@
 import logging
 import re
+from typing import override
 
 from PIL import Image, ImageDraw, ImageOps
 from PIL.ImageQt import ImageQt
-from PyQt6.QtCore import QObject, QRunnable, Qt, QThreadPool, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QMouseEvent, QPixmap
+from PyQt6.QtCore import QObject, QPointF, QRunnable, QSizeF, Qt, QThreadPool, QUrl, pyqtSignal
+from PyQt6.QtGui import QDesktopServices, QMouseEvent, QPainter, QPaintEvent, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -46,6 +47,45 @@ IMAGE_MARGIN = 32
 IMAGE_CACHE_SIZE = 128
 # Holds the global "Let apps access my notifications" switch
 NOTIFICATION_PRIVACY_URI = "ms-settings:privacy-notifications"
+# Between a section's icon and the name beside it
+SECTION_ICON_GAP = 6
+
+
+class SectionHeaderLabel(QLabel):
+    """A section header with the icon of the sender drawn in front of its name.
+
+    One label rather than an icon and a label side by side, because a stylesheet reaches a
+    widget and not its children: split in two, the font and the colour written for the
+    header would stop reaching the name. So the text is indented to leave room and the icon
+    is drawn into the gap. Qt's own inline images are no use for this: where one lands
+    depends on how tall it is, so an icon that sits right at one size sits low at the next.
+    """
+
+    def __init__(self, text: str, icon: QPixmap, parent: QWidget | None = None):
+        super().__init__(text, parent)
+        self._icon = icon
+        self.setIndent(round(self._icon_size().width()) + SECTION_ICON_GAP)
+
+    def _icon_size(self) -> QSizeF:
+        """The icon in the pixels the label is laid out in, not the ones it was drawn at."""
+        ratio = self._icon.devicePixelRatio() or 1.0
+        return QSizeF(self._icon.width() / ratio, self._icon.height() / ratio)
+
+    @override
+    def paintEvent(self, event: QPaintEvent | None) -> None:
+        super().paintEvent(event)
+        size = self._icon_size()
+        contents = self.contentsRect()
+        # Centred in the box the label centres its line in, so the two share an axis. Not
+        # worked out from the baseline and the x-height instead: that is where an inline
+        # image belongs by the book, but it reads as sitting low, and it puts the icon at
+        # the mercy of metrics a font is free to be wrong about
+        top = contents.top() + (contents.height() - size.height()) / 2
+        painter = QPainter(self)
+        try:
+            painter.drawPixmap(QPointF(float(contents.left()), top), self._icon)
+        finally:
+            painter.end()
 
 
 class AppIconSignals(QObject):
@@ -395,19 +435,8 @@ class NotificationsWidget(BaseWidget):
         if not notifications:
             content_layout.addLayout(self._build_empty_state())
         elif self.config.menu.group_by_app:
-            grouped: dict[str, list[NotificationItem]] = {}
-            for notification in notifications:
-                grouped.setdefault(notification.app_name, []).append(notification)
-            # Senders that expose no app info have no name to head them with, so they are
-            # collected under a generic header and moved last instead of trailing a real app
-            unnamed = grouped.pop("", None)
-            if unnamed:
-                grouped[""] = unnamed
-            for app_name, items in grouped.items():
-                section_header = QLabel(app_name or "Other")
-                section_header.setProperty("class", "section-header" if app_name else "section-header other")
-                section_header.setTextFormat(Qt.TextFormat.PlainText)
-                content_layout.addWidget(section_header)
+            for items in self._group_by_sender(notifications):
+                content_layout.addWidget(self._build_section_header(items[0]))
                 content_layout.addWidget(self._build_section(items, show_app_name=False))
         else:
             content_layout.addWidget(self._build_section(notifications, show_app_name=True))
@@ -431,6 +460,45 @@ class NotificationsWidget(BaseWidget):
             offset_left=self.config.menu.offset_left,
             offset_top=self.config.menu.offset_top,
         )
+
+    @staticmethod
+    def _group_by_sender(notifications: list[NotificationItem]) -> list[list[NotificationItem]]:
+        """The notifications in the order they are shown, split into the sections they head.
+
+        Grouped the way the Notification Center groups them, by the sender Windows filed
+        them under rather than by the app the listener names: a browser files one sender
+        per website, so a page's notifications sit under the page instead of all of them
+        landing together under the browser.
+        """
+        sections: dict[str, list[NotificationItem]] = {}
+        # Senders that expose no name at all have nothing to head them with, so they are
+        # collected under a generic header and moved last instead of trailing a real app
+        unnamed: list[NotificationItem] = []
+        for notification in notifications:
+            if notification.app_name:
+                sections.setdefault(notification.sender_id, []).append(notification)
+            else:
+                unnamed.append(notification)
+        return [*sections.values(), unnamed] if unnamed else list(sections.values())
+
+    def _build_section_header(self, notification: NotificationItem) -> QLabel:
+        """The name a section is headed with, next to the icon Windows heads it with."""
+        icon = self._section_icon(notification.sender_icon)
+        text = notification.app_name or "Other"
+        section_header = QLabel(text) if icon is None else SectionHeaderLabel(text, icon)
+        section_header.setProperty("class", "section-header" if notification.app_name else "section-header other")
+        section_header.setTextFormat(Qt.TextFormat.PlainText)
+        return section_header
+
+    def _section_icon(self, path: str) -> QPixmap | None:
+        """The icon Windows registered for the sender, if it registered one.
+
+        Only senders it keeps an icon for have one, which in practice means websites: an
+        app is headed by its name alone, the way it already was.
+        """
+        if not self.config.menu.show_app_icons or not path:
+            return None
+        return self._get_app_logo(path, circle=False, size=self.config.menu.section_icon_size)
 
     def _build_empty_state(self) -> QVBoxLayout:
         icon_label = QLabel(self.config.icons.default)
@@ -515,7 +583,7 @@ class NotificationsWidget(BaseWidget):
         container_layout.addLayout(row_layout)
 
         if self.config.menu.show_app_icons:
-            icon_label = self._build_icon_label(notification)
+            icon_label = self._build_icon_label(notification, grouped=not show_app_name)
             if icon_label is not None:
                 row_layout.addWidget(icon_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
@@ -597,7 +665,7 @@ class NotificationsWidget(BaseWidget):
 
         return mouse_press_event
 
-    def _build_icon_label(self, notification: NotificationItem) -> QLabel | None:
+    def _build_icon_label(self, notification: NotificationItem, grouped: bool) -> QLabel | None:
         """The icon slot of an item, or None when there is no icon to draw in it.
 
         A toast can override the app icon with one of its own, a contact photo for example,
@@ -608,11 +676,17 @@ class NotificationsWidget(BaseWidget):
         rather than pushing the text along.
         """
         dpr = self._device_pixel_ratio()
-        if self.config.menu.show_images and notification.app_logo:
-            logo = self._get_app_logo(notification.app_logo, notification.app_logo_circle)
-            if logo is not None:
-                # An app logo override belongs in the app icon's place, the way Windows shows it
-                return self._icon_label(logo, "icon app-logo")
+        if self.config.menu.show_images:
+            logos = [(notification.app_logo, notification.app_logo_circle)]
+            if not grouped:
+                # Ungrouped there is no section header carrying the sender's own icon, so
+                # the item falls back to it before falling back to the app it came through
+                logos.append((notification.sender_icon, False))
+            for path, circle in logos:
+                logo = self._get_app_logo(path, circle) if path else None
+                if logo is not None:
+                    # An app logo override belongs in the app icon's place, the way Windows shows it
+                    return self._icon_label(logo, "icon app-logo")
 
         aumid = notification.aumid
         if not aumid:
@@ -694,13 +768,13 @@ class NotificationsWidget(BaseWidget):
             self._placeholders[dpr] = pixmap
         return pixmap
 
-    def _icon_pixels(self, dpr: float) -> int:
-        """The icon edge in device pixels.
+    def _icon_pixels(self, dpr: float, size: int | None = None) -> int:
+        """The edge of an icon in device pixels, an app icon's own size unless told otherwise.
 
         A stylesheet cannot resize this: Qt draws a label's pixmap at the size it was made
         at, so the size has to be known before the pixmap is built.
         """
-        return max(1, int(round(self.config.menu.app_icon_size * dpr)))
+        return max(1, int(round((size or self.config.menu.app_icon_size) * dpr)))
 
     def _device_pixel_ratio(self) -> float:
         screen = self._menu.screen() if is_valid_qobject(self._menu) else self.screen()
@@ -719,10 +793,10 @@ class NotificationsWidget(BaseWidget):
         image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return image_label
 
-    def _get_app_logo(self, path: str, circle: bool) -> QPixmap | None:
+    def _get_app_logo(self, path: str, circle: bool, size: int | None = None) -> QPixmap | None:
         """Load the app logo a toast brought with it, cropped square and optionally round."""
         dpr = self._device_pixel_ratio()
-        size = self._icon_pixels(dpr)
+        size = self._icon_pixels(dpr, size)
         cache_key = (path, size, size, circle, dpr)
         if cache_key in self._image_cache:
             return self._image_cache[cache_key]
