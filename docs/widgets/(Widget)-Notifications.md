@@ -83,7 +83,7 @@ Displays the number of unread Windows notifications in your status bar. Clicking
   - `on_right`: Callback for right-click event.
 
 > [!NOTE]
-> Clicking a notification brings the sending app to the foreground. Only the dismiss button removes it, and removing a notification here also removes it from the Windows Notification Center.
+> Clicking a notification does what clicking it in the Notification Center does: the app it came from is given that particular notification, so a screenshot notification opens the screenshot and a website notification opens the page behind it. An activated notification is removed, the same way Windows removes it. An app that registered no way of being handed a notification is only brought to the foreground and keeps it. Removing a notification here, by clicking it or by dismissing it, also removes it from the Windows Notification Center.
 
 > [!NOTE]
 > `{count}` on the bar counts the notifications the menu lists, so the two always agree. Windows publishes a count of its own for the shell, but it is not one to write on a bar: a notification activated from the Notification Center is taken out of the list without being taken out of that count, which then stays too high until something else resets it. It is used for one case only, when the permission below has been turned off and there is no list to count.

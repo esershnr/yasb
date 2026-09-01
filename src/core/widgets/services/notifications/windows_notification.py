@@ -81,6 +81,9 @@ class NotificationItem:
     # by and heads with a name and an icon of its own
     sender_id: str = ""
     sender_icon: str = ""
+    # What the shell hands the sender when the notification is clicked, and how
+    launch: str = ""
+    activation_type: str = ""
 
 
 class WindowsNotificationEventListener(QThread):
@@ -330,9 +333,9 @@ class WindowsNotificationEventListener(QThread):
         """Fill in what the listener API does not hand out but Windows stored anyway.
 
         The images a toast carries are only in the payload Windows kept for itself, and so
-        is the sender, which the listener reports as the app it came through while the
-        database files it the way the Notification Center groups it, one entry per website
-        for a browser. The whole batch is looked up in one read.
+        is the launch string that says what clicking it should do. So is the sender, which
+        the listener reports as the app while the database files it the way the Notification
+        Center groups it, one entry per website for a browser. The batch is read in one go.
         """
         try:
             details = read_toast_details({item.id: item.aumid for item in items})
@@ -362,6 +365,8 @@ class WindowsNotificationEventListener(QThread):
                     inline_images=found.images.inline,
                     sender_id=found.sender or item.aumid,
                     sender_icon=found.sender_icon,
+                    launch=found.launch,
+                    activation_type=found.activation_type,
                 )
             )
         return enriched

@@ -24,6 +24,7 @@ from core.utils.utilities import ElidedLabel, PopupWidget, refresh_widget_style
 from core.utils.win32.app_icons import get_icon_for_aumid
 from core.utils.win32.aumid import activate_app_by_aumid
 from core.utils.win32.system_function import notification_center, quick_settings
+from core.utils.win32.toast_activation import activate_toast
 from core.validation.widgets.yasb.notifications import NotificationsConfig
 from core.widgets.base import BaseWidget
 from core.widgets.services.dnd.dnd_api import DndService
@@ -132,6 +133,9 @@ class NotificationsWidget(BaseWidget):
     windows_notifications_changed_signal = pyqtSignal(list)
     windows_notification_access_signal = pyqtSignal(bool)
     dnd_status_changed_signal = pyqtSignal(str)
+    # Raising a window is the GUI thread's job, and the click that asks for it is not
+    # always still on it by then
+    raise_app_signal = pyqtSignal(str)
     event_listener = WindowsNotificationEventListener
 
     def __init__(self, config: NotificationsConfig):
@@ -177,6 +181,7 @@ class NotificationsWidget(BaseWidget):
         self.windows_notification_update_signal.connect(self._on_windows_notification_update)
         self.windows_notifications_changed_signal.connect(self._on_notifications_changed)
         self.windows_notification_access_signal.connect(self._on_access_changed)
+        self.raise_app_signal.connect(self._raise_app)
 
         if self.config.menu.show_dnd_toggle:
             DndService.initialize_wnf_listener()
@@ -654,16 +659,44 @@ class NotificationsWidget(BaseWidget):
         return mouse_press_event
 
     def _create_activate_event(self, notification: NotificationItem):
-        """Bring the sending app to the front. Removing the notification is the dismiss button's job."""
+        """Do with a click what the Notification Center does with one."""
 
         def mouse_press_event(_a0: QMouseEvent | None) -> None:
-            if notification.aumid:
-                activate_app_by_aumid(
-                    notification.aumid,
-                    fallback_process_name=get_process_name_for_aumid(notification.aumid),
-                )
+            if is_valid_qobject(self._menu):
+                self._menu.hide_animated()
+            self._activate_notification(notification)
 
         return mouse_press_event
+
+    def _activate_notification(self, notification: NotificationItem):
+        """Hand a notification back to the app that sent it, away from the GUI thread.
+
+        Handing it over means giving the app the launch string of that particular toast,
+        which is what makes a screenshot notification open the screenshot rather than the
+        tool that took it. Windows takes an activated notification off the list, so this
+        does too. A sender that registered no way of being handed one is only brought to
+        the front, and keeps its notification.
+
+        Not on the GUI thread, because handing a notification to an app that is not running
+        takes as long as the app takes to start, which is not something the bar should be
+        waiting on. Only the handover happens out here: raising a window is left to the
+        thread that owns them.
+        """
+        notification_id = notification.id
+        aumid = notification.aumid
+        launch = notification.launch
+        activation_type = notification.activation_type
+
+        def activate():
+            if activate_toast(aumid, launch, activation_type):
+                self._remove_notification(notification_id)
+            elif aumid and is_valid_qobject(self):
+                self.raise_app_signal.emit(aumid)
+
+        self._icon_pool.start(activate)
+
+    def _raise_app(self, aumid: str):
+        activate_app_by_aumid(aumid, fallback_process_name=get_process_name_for_aumid(aumid))
 
     def _build_icon_label(self, notification: NotificationItem, grouped: bool) -> QLabel | None:
         """The icon slot of an item, or None when there is no icon to draw in it.
