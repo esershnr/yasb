@@ -15,6 +15,7 @@ A sender that has neither cannot be handed anything, and the caller is told so.
 import ctypes
 import ctypes.wintypes as wt
 import logging
+import re
 import winreg
 import xml.etree.ElementTree as ET
 from ctypes import POINTER, WINFUNCTYPE, byref, c_void_p
@@ -36,6 +37,9 @@ SHELL_EXECUTE_MIN_SUCCESS = 32
 # Let whichever process the notification goes to take the foreground, which it is only
 # allowed to do because the click that got us here happened in a window of ours
 ASFW_ANY = 0xFFFFFFFF
+# A URI scheme as RFC 3986 spells it, two letters at the least so that a drive letter,
+# which reads as a one letter scheme, is not taken for one
+URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]+:")
 
 IID_INotificationActivationCallback = GUID("53E31837-6600-4A81-9395-75CFFE746F94")
 # Where a plain desktop app registers the class the shell calls back into. A packaged app
@@ -79,8 +83,15 @@ def activate_toast(aumid: str, launch: str, activation_type: str) -> bool:
 
 
 def _open_protocol(launch: str) -> bool:
-    """Open the URI a toast names, which is what protocol activation amounts to."""
-    if not launch:
+    """Open the URI a toast names, which is what protocol activation amounts to.
+
+    Only a URI, the way the shell only launches one: ShellExecute would just as readily
+    run a program or open a file, and the launch string is written by the sender. A file:
+    URI is a path by another name, so it is turned away with the rest.
+    """
+    if not URI_SCHEME.match(launch) or launch[:5].casefold() == "file:":
+        if launch:
+            logging.debug("Not opening a notification protocol that is not a URI: %s", launch)
         return False
     AllowSetForegroundWindow(ASFW_ANY)
     result = shell_execute(launch)
