@@ -1,5 +1,7 @@
 import logging
 import re
+from collections.abc import Callable
+from functools import partial
 from typing import override
 
 from PIL import Image, ImageDraw, ImageOps
@@ -50,6 +52,8 @@ IMAGE_CACHE_SIZE = 128
 NOTIFICATION_PRIVACY_URI = "ms-settings:privacy-notifications"
 # Between a section's icon and the name beside it
 SECTION_ICON_GAP = 6
+# Decodes one toast image, on whichever thread it is handed to
+type ImageDecoder = Callable[[], Image.Image | None]
 
 
 class SectionHeaderLabel(QLabel):
@@ -127,6 +131,29 @@ class AppIconLoader(QRunnable):
         self.signals.loaded.emit(self._aumid, self._dpr, image)
 
 
+class ImageSignals(QObject):
+    # image cache key, PIL image or None
+    loaded = pyqtSignal(object, object)
+
+
+class ImageLoader(QRunnable):
+    """Decodes and scales one toast image away from the GUI thread.
+
+    A photo takes around ten milliseconds, so a menu holding a few dozen of them would
+    spend a noticeable while on the click. Like the app icon loader, this only produces
+    the pixels and leaves turning them into a pixmap to the thread that owns them.
+    """
+
+    def __init__(self, cache_key: tuple, decode: ImageDecoder):
+        super().__init__()
+        self._cache_key = cache_key
+        self._decode = decode
+        self.signals = ImageSignals()
+
+    def run(self):
+        self.signals.loaded.emit(self._cache_key, self._decode())
+
+
 class NotificationsWidget(BaseWidget):
     validation_schema = NotificationsConfig
     windows_notification_update_signal = pyqtSignal(int)
@@ -154,6 +181,7 @@ class NotificationsWidget(BaseWidget):
         self._icon_cache: dict[tuple[str, float], QPixmap | None] = {}
         # (path, width, height, circle, dpr) -> pixmap
         self._image_cache: dict[tuple[str, int, int, bool, float], QPixmap | None] = {}
+        self._image_pending: set[tuple[str, int, int, bool, float]] = set()
         self._icon_pending: set[tuple[str, float]] = set()
         # The icon slots of the menu as it stands, waiting for a loader to fill them in
         self._icon_labels: dict[tuple[str, float], list[QLabel]] = {}
@@ -201,6 +229,7 @@ class NotificationsWidget(BaseWidget):
     def _on_notifications_changed(self, notifications: list[NotificationItem]):
         if self.config.menu.show_app_icons:
             self._warm_app_icons(notifications)
+        self._warm_images(notifications)
         # Opening the menu draws the list we already hold and asks the listener for a fresh
         # one at the same time. That reply is usually the same list, and rebuilding every
         # item to arrive at the same menu is the one thing that makes opening it feel slow
@@ -693,7 +722,8 @@ class NotificationsWidget(BaseWidget):
             elif aumid and is_valid_qobject(self):
                 self.raise_app_signal.emit(aumid)
 
-        self._icon_pool.start(activate)
+        # Ahead of any pictures still being prepared, which nobody is waiting on
+        self._icon_pool.start(activate, 1)
 
     def _raise_app(self, aumid: str):
         activate_app_by_aumid(aumid, fallback_process_name=get_process_name_for_aumid(aumid))
@@ -787,7 +817,7 @@ class NotificationsWidget(BaseWidget):
             pixmap.setDevicePixelRatio(dpr)
             return pixmap
         except Exception:
-            logging.exception("Failed to read an app icon")
+            logging.exception("Failed to turn an icon or a toast image into a pixmap")
             return None
 
     def _placeholder_pixmap(self, dpr: float) -> QPixmap:
@@ -827,56 +857,106 @@ class NotificationsWidget(BaseWidget):
         return image_label
 
     def _get_app_logo(self, path: str, circle: bool, size: int | None = None) -> QPixmap | None:
-        """Load the app logo a toast brought with it, cropped square and optionally round."""
-        dpr = self._device_pixel_ratio()
-        size = self._icon_pixels(dpr, size)
-        cache_key = (path, size, size, circle, dpr)
-        if cache_key in self._image_cache:
-            return self._image_cache[cache_key]
-
-        pixmap = None
-        try:
-            with Image.open(path) as source:
-                # These are photos as often as icons, so they are cropped to fill the square
-                image = ImageOps.fit(self._resizable(source), (size, size), Image.LANCZOS).convert("RGBA")
-            if circle:
-                round_image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-                round_image.paste(image, mask=self._circle_mask(size))
-                image = round_image
-            # Copy to avoid a dangling view into the PIL buffer
-            pixmap = QPixmap.fromImage(ImageQt(image).copy())
-            pixmap.setDevicePixelRatio(dpr)
-        except Exception:
-            logging.debug("Failed to load the app logo of a notification", exc_info=True)
-
-        self._cache_image(cache_key, pixmap)
-        return pixmap
+        """The app logo a toast brought with it, cropped square and optionally round."""
+        return self._cached_image(*self._app_logo_job(path, circle, size))
 
     def _get_notification_image(self, path: str) -> QPixmap | None:
-        """Load a hero or inline image, scaled to fit the menu."""
+        """A hero or inline image, scaled to fit the menu."""
+        return self._cached_image(*self._notification_image_job(path))
+
+    def _app_logo_job(self, path: str, circle: bool, size: int | None = None):
+        """The cache key of an app logo and what decodes it, for the menu and the loader alike."""
+        dpr = self._device_pixel_ratio()
+        pixels = self._icon_pixels(dpr, size)
+        return (path, pixels, pixels, circle, dpr), partial(self._decode_app_logo, path, pixels, circle)
+
+    def _notification_image_job(self, path: str):
+        """The cache key of a hero or inline image and what decodes it."""
         dpr = self._device_pixel_ratio()
         width = max(1, self.config.menu.width - IMAGE_MARGIN)
         height = self.config.menu.image_max_height
-        cache_key = (path, width, height, False, dpr)
-        if cache_key in self._image_cache:
-            return self._image_cache[cache_key]
+        box = (max(1, int(width * dpr)), max(1, int(height * dpr)))
+        return (path, width, height, False, dpr), partial(self._decode_notification_image, path, box)
 
-        pixmap = None
+    def _cached_image(self, cache_key: tuple[str, int, int, bool, float], decode: ImageDecoder) -> QPixmap | None:
+        """An image from the cache, decoded on the spot if the loader has not got to it yet.
+
+        The spot is the GUI thread, which is only ever the case for a picture that arrived
+        a moment before the menu was built: everything else was warmed as the list came in.
+        """
+        if cache_key not in self._image_cache:
+            self._store_image(cache_key, decode())
+        return self._image_cache[cache_key]
+
+    def _warm_images(self, notifications: list[NotificationItem]):
+        """Start on the pictures of the list as soon as it arrives, the way app icons are.
+
+        Only the ones the menu is going to draw, asked for with the same keys it will look
+        them up by, so the menu finds them ready and draws exactly what it drew before.
+        """
+        menu = self.config.menu
+        for notification in notifications[: menu.max_notifications]:
+            jobs = []
+            if menu.show_images:
+                paths = (notification.hero, *notification.inline_images)
+                jobs.extend(self._notification_image_job(path) for path in paths if path)
+                if menu.show_app_icons and notification.app_logo:
+                    jobs.append(self._app_logo_job(notification.app_logo, notification.app_logo_circle))
+                if menu.show_app_icons and not menu.group_by_app and notification.sender_icon:
+                    jobs.append(self._app_logo_job(notification.sender_icon, False))
+            if menu.show_app_icons and menu.group_by_app and notification.sender_icon:
+                jobs.append(self._app_logo_job(notification.sender_icon, False, menu.section_icon_size))
+            for cache_key, decode in jobs:
+                self._request_image(cache_key, decode)
+
+    def _request_image(self, cache_key: tuple[str, int, int, bool, float], decode: ImageDecoder):
+        if cache_key in self._image_cache or cache_key in self._image_pending:
+            return
+        self._image_pending.add(cache_key)
+        loader = ImageLoader(cache_key, decode)
+        loader.signals.loaded.connect(self._on_image_loaded)
+        self._icon_pool.start(loader)
+
+    def _on_image_loaded(self, cache_key: tuple[str, int, int, bool, float], image: object):
+        self._image_pending.discard(cache_key)
+        # The menu may have needed it first and decoded it itself
+        if cache_key not in self._image_cache:
+            self._store_image(cache_key, image)
+
+    def _store_image(self, cache_key: tuple[str, int, int, bool, float], image: Image.Image | None):
+        pixmap = self._to_pixmap(image, cache_key[-1]) if image is not None else None
+        self._cache_image(cache_key, pixmap)
+
+    @classmethod
+    def _decode_app_logo(cls, path: str, size: int, circle: bool) -> Image.Image | None:
+        """Safe to run off the GUI thread: PIL only, no Qt."""
         try:
             with Image.open(path) as source:
-                image = self._resizable(source)
+                # These are photos as often as icons, so they are cropped to fill the square
+                image = ImageOps.fit(cls._resizable(source), (size, size), Image.LANCZOS).convert("RGBA")
+            if circle:
+                round_image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                round_image.paste(image, mask=cls._circle_mask(size))
+                image = round_image
+            return image
+        except Exception:
+            logging.debug("Failed to load the app logo of a notification", exc_info=True)
+            return None
+
+    @classmethod
+    def _decode_notification_image(cls, path: str, box: tuple[int, int]) -> Image.Image | None:
+        """Safe to run off the GUI thread: PIL only, no Qt."""
+        try:
+            with Image.open(path) as source:
+                image = cls._resizable(source)
                 # Fits the box without cropping, and leaves an image smaller than it alone.
                 # The conversion stays inside the block: an image that already fits is not
                 # resized at all, and its pixels are still to be read from the open file
-                image.thumbnail((max(1, int(width * dpr)), max(1, int(height * dpr))), Image.LANCZOS)
-                image = image.convert("RGBA")
-            pixmap = QPixmap.fromImage(ImageQt(image).copy())
-            pixmap.setDevicePixelRatio(dpr)
+                image.thumbnail(box, Image.LANCZOS)
+                return image.convert("RGBA")
         except Exception:
             logging.debug("Failed to load a notification image", exc_info=True)
-
-        self._cache_image(cache_key, pixmap)
-        return pixmap
+            return None
 
     def _cache_image(self, cache_key: tuple[str, int, int, bool, float], pixmap: QPixmap | None):
         # Dropping the lot is enough: the menu rebuilds from the entries it just filled in
