@@ -20,37 +20,22 @@ import xml.etree.ElementTree as ET
 from ctypes import POINTER, WINFUNCTYPE, byref, c_void_p
 from functools import lru_cache
 
-from core.utils.win32.aumid import GUID
+from core.utils.win32.aumid import GUID, _ensure_com_initialized
+from core.utils.win32.bindings import AllowSetForegroundWindow, shell_execute
 from core.utils.win32.packages import installed_path, package_family_name
 
 ole32 = ctypes.WinDLL("ole32", use_last_error=True)
-shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-
-CoInitializeEx = ole32.CoInitializeEx
-CoInitializeEx.argtypes = [c_void_p, ctypes.c_ulong]
-CoInitializeEx.restype = ctypes.c_long
 
 CoCreateInstance = ole32.CoCreateInstance
 CoCreateInstance.argtypes = [POINTER(GUID), c_void_p, ctypes.c_ulong, POINTER(GUID), POINTER(c_void_p)]
 CoCreateInstance.restype = ctypes.c_long
 
-ShellExecuteW = shell32.ShellExecuteW
-ShellExecuteW.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, ctypes.c_int]
-ShellExecuteW.restype = wt.HINSTANCE
-
-AllowSetForegroundWindow = user32.AllowSetForegroundWindow
-AllowSetForegroundWindow.argtypes = [wt.DWORD]
-AllowSetForegroundWindow.restype = wt.BOOL
-
-COINIT_APARTMENTTHREADED = 0x2
 CLSCTX_LOCAL_SERVER = 0x4
-SW_SHOWNORMAL = 1
 # ShellExecute reports failure as a value that would be a meaningless instance handle
 SHELL_EXECUTE_MIN_SUCCESS = 32
 # Let whichever process the notification goes to take the foreground, which it is only
 # allowed to do because the click that got us here happened in a window of ours
-ASFW_ANY = wt.DWORD(-1)
+ASFW_ANY = 0xFFFFFFFF
 
 IID_INotificationActivationCallback = GUID("53E31837-6600-4A81-9395-75CFFE746F94")
 # Where a plain desktop app registers the class the shell calls back into. A packaged app
@@ -98,7 +83,7 @@ def _open_protocol(launch: str) -> bool:
     if not launch:
         return False
     AllowSetForegroundWindow(ASFW_ANY)
-    result = ShellExecuteW(None, "open", launch, None, None, SW_SHOWNORMAL)
+    result = shell_execute(launch)
     if result and result > SHELL_EXECUTE_MIN_SUCCESS:
         return True
     logging.debug("Failed to open the notification protocol %s (%s)", launch, result)
@@ -113,7 +98,7 @@ def _invoke_activator(aumid: str, launch: str) -> bool:
 
     # An apartment of some kind is needed before the class can be created, and the caller
     # is not always one that has been in COM before
-    CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+    _ensure_com_initialized()
     activator = c_void_p()
     hr = CoCreateInstance(
         byref(GUID(clsid)),
