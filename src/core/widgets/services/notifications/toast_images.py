@@ -50,6 +50,8 @@ SOURCE_KEY_LENGTH = 12
 
 # (registry write time, url -> file), rebuilt only once Windows has touched the record
 _downloads: tuple[int, dict[str, str]] | None = None
+# The kept copies whose notification was missing from the last read, see _prune_kept
+_missing: set[str] = set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,7 +275,16 @@ def _kept_path(notification_id: int, role: str, src: str, resolved: str) -> Path
 
 
 def _prune_kept(senders: dict[int, str]) -> None:
-    """Drop the copies of notifications that are no longer in the Notification Center."""
+    """Drop the copies of notifications that are no longer in the Notification Center.
+
+    A copy goes once its notification has been missing from two reads in a row rather than
+    from one. The copy is all that is left of the picture, so a single read that comes back
+    short must not be able to take it for good: if the next read brings the notification
+    back, the copy is still there to be drawn. A notification that has really gone is still
+    missing the next time, which is soon, since opening the menu is itself a read.
+    """
+    global _missing
+    missing: set[str] = set()
     try:
         directory = app_data_path(CACHE_DIRECTORY)
         if not directory.is_dir():
@@ -282,12 +293,16 @@ def _prune_kept(senders: dict[int, str]) -> None:
             notification_id, _, _ = kept.name.partition("-")
             if notification_id.isdigit() and int(notification_id) in senders:
                 continue
+            if kept.name not in _missing:
+                missing.add(kept.name)
+                continue
             try:
                 kept.unlink()
             except OSError as e:
                 logging.debug("Failed to drop the kept copy %s: %s", kept.name, e)
     except OSError as e:
         logging.debug("Failed to go through the kept toast images: %s", e)
+    _missing = missing
 
 
 def _resolve_src(src: str, aumid: str) -> str:
