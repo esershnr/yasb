@@ -405,6 +405,13 @@ def _verify(path: Path, root: Path | None = None) -> str:
     A package relative source is checked against the folder it was resolved from as well,
     since the payload is written by the sending app and can walk out of it.
     """
+    # A network share is refused before it is touched: resolving one is already a request
+    # to that host, and one that offers it the user's credentials. What Windows downloads
+    # or keeps for a toast is always on a local drive, so only a payload written to make
+    # the menu reach out would name one
+    if path.drive.startswith(("\\\\", "//")):
+        logging.debug("Toast image is on a network path: %s", path)
+        return ""
     try:
         resolved = path.resolve()
         if root is not None and not resolved.is_relative_to(root.resolve()):
