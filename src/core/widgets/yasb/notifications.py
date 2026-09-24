@@ -737,20 +737,34 @@ class NotificationsWidget(BaseWidget):
         That one has to be extracted and may not be ready yet, so its slot holds the space
         with a transparent stand-in and the picture drops into it when the loader is done,
         rather than pushing the text along.
-        """
-        dpr = self._device_pixel_ratio()
-        if self.config.menu.show_images:
-            logos = [(notification.app_logo, notification.app_logo_circle)]
-            if not grouped:
-                # Ungrouped there is no section header carrying the sender's own icon, so
-                # the item falls back to it before falling back to the app it came through
-                logos.append((notification.sender_icon, False))
-            for path, circle in logos:
-                logo = self._get_app_logo(path, circle) if path else None
-                if logo is not None:
-                    # An app logo override belongs in the app icon's place, the way Windows shows it
-                    return self._icon_label(logo, "icon app-logo")
 
+        A website is the exception. The app its notifications come through is the browser,
+        which is not what sent them, and the shell has no icon for the name the browser
+        gives it here, only a blank document. So a website that brought no picture of its
+        own gets no icon at all, the way the Notification Center shows it, or the site's
+        own icon when show_site_icons asks for it.
+        """
+        menu = self.config.menu
+        website = self._is_from_website(notification)
+        logos: list[tuple[str, bool]] = []
+        if menu.show_images:
+            logos.append((notification.app_logo, notification.app_logo_circle))
+        if website:
+            if menu.show_site_icons:
+                logos.append((notification.sender_icon, False))
+        elif menu.show_images and not grouped:
+            # Ungrouped there is no section header carrying the sender's own icon, so
+            # the item falls back to it before falling back to the app it came through
+            logos.append((notification.sender_icon, False))
+        for path, circle in logos:
+            logo = self._get_app_logo(path, circle) if path else None
+            if logo is not None:
+                # An app logo override belongs in the app icon's place, the way Windows shows it
+                return self._icon_label(logo, "icon app-logo")
+        if website:
+            return None
+
+        dpr = self._device_pixel_ratio()
         aumid = notification.aumid
         if not aumid:
             return None
@@ -767,6 +781,15 @@ class NotificationsWidget(BaseWidget):
         return icon_label
 
     @staticmethod
+    def _is_from_website(notification: NotificationItem) -> bool:
+        """Whether the notification came from a website rather than from the app it names.
+
+        The listener names the browser, while the notification database files each website
+        as a sender of its own, so the two disagree only for a website's notifications.
+        """
+        return bool(notification.sender_id) and notification.sender_id.casefold() != notification.aumid.casefold()
+
+    @staticmethod
     def _icon_label(pixmap: QPixmap, class_name: str) -> QLabel:
         icon_label = QLabel()
         icon_label.setProperty("class", class_name)
@@ -781,7 +804,9 @@ class NotificationsWidget(BaseWidget):
         slow enough that doing it on the click is what makes opening the menu feel slow.
         """
         dpr = self._device_pixel_ratio()
-        for aumid in {notification.aumid for notification in notifications if notification.aumid}:
+        # A website never falls back to the icon of the browser it came through
+        aumids = {n.aumid for n in notifications if n.aumid and not self._is_from_website(n)}
+        for aumid in aumids:
             self._request_app_icon(aumid, dpr)
 
     def _request_app_icon(self, aumid: str, dpr: float):
@@ -902,7 +927,13 @@ class NotificationsWidget(BaseWidget):
                 jobs.extend(self._notification_image_job(path) for path in paths if path)
                 if menu.show_app_icons and notification.app_logo:
                     jobs.append(self._app_logo_job(notification.app_logo, notification.app_logo_circle))
-                if menu.show_app_icons and not menu.group_by_app and notification.sender_icon:
+            # The sender's icon in the item itself, on the same terms _build_icon_label draws it
+            if menu.show_app_icons and notification.sender_icon:
+                if self._is_from_website(notification):
+                    in_item = menu.show_site_icons
+                else:
+                    in_item = menu.show_images and not menu.group_by_app
+                if in_item:
                     jobs.append(self._app_logo_job(notification.sender_icon, False))
             if menu.show_app_icons and menu.group_by_app and notification.sender_icon:
                 jobs.append(self._app_logo_job(notification.sender_icon, False, menu.section_icon_size))
