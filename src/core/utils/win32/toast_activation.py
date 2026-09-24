@@ -19,7 +19,6 @@ import re
 import winreg
 import xml.etree.ElementTree as ET
 from ctypes import POINTER, WINFUNCTYPE, byref, c_void_p
-from functools import lru_cache
 
 from core.utils.win32.aumid import GUID, _ensure_com_initialized
 from core.utils.win32.bindings import AllowSetForegroundWindow, shell_execute
@@ -141,12 +140,25 @@ def _invoke_activator(aumid: str, launch: str) -> bool:
             pass
 
 
-@lru_cache(maxsize=64)
+# aumid -> clsid, for senders that have one
+_activators: dict[str, str] = {}
+
+
 def toast_activator_clsid(aumid: str) -> str:
-    """The class the sender registered to be called back on, or an empty string if none."""
+    """The class the sender registered to be called back on, or an empty string if none.
+
+    Only a class that was found is remembered. A sender without one is looked up again on
+    the next click, since it may have registered one since, and a click is rare enough for
+    a registry read and a manifest to cost nothing that anybody notices.
+    """
     if not aumid:
         return ""
-    return _registered_activator(aumid) or _declared_activator(aumid)
+    clsid = _activators.get(aumid)
+    if clsid is None:
+        clsid = _registered_activator(aumid) or _declared_activator(aumid)
+        if clsid:
+            _activators[aumid] = clsid
+    return clsid
 
 
 def _registered_activator(aumid: str) -> str:
